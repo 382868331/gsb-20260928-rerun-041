@@ -1,0 +1,52 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+EntityType = Literal["patient", "encounter", "observation"]
+
+
+@dataclass(frozen=True)
+class Source:
+    id: str
+    name: str = ""
+
+    def key(self) -> str:
+        return self.id
+
+
+@dataclass(frozen=True)
+class EntityKey:
+    source_id: str
+    entity_type: str
+    source_record_id: str
+
+    def canonical_id(self) -> str:
+        return f"{self.source_id}/{self.entity_type}/{self.source_record_id}"
+
+
+@dataclass(frozen=True)
+class Version:
+    version: int
+    data: dict[str, Any]
+    content_hash: str
+
+
+@dataclass
+class Entity:
+    key: EntityKey
+    current_version: int
+    versions: dict[int, Version] = field(default_factory=dict)
+
+    @property
+    def current(self) -> Version:
+        return self.versions[self.current_version]
+
+
+@dataclass(frozen=True)
+class PendingReference:
+    source_entity: str
+    field_name: str
+    target_type: str
+    target: EntityKey
+
