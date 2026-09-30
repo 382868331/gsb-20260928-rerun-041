@@ -319,6 +319,162 @@ class ExchangeTests(unittest.TestCase):
         self.assertEqual(re_exported['identity_operations'], exported['identity_operations'])
         self.assertEqual(re_exported['patient_identity_groups'], exported['patient_identity_groups'])
 
+    def test_export_roundtrip_preserves_full_version_history_and_summaries(self):
+        source_store = RecordStore()
+        source_store.import_bundle(bundle(records=[
+            {'id': 'p-1', 'type': 'patient', 'version': 1,
+             'summary': 'v1 intake', 'data': {'name': 'Zhang San'}},
+        ]))
+        source_store.import_bundle(bundle(records=[
+            {'id': 'p-1', 'type': 'patient', 'version': 2, 'summary': 'v2 demographics',
+             'data': {'name': 'Zhang San (updated)'}},
+        ]))
+        exported = export_bundle(source_store)
+        exported_patient = exported['entities'][0]
+        self.assertEqual(
+            [item['version'] for item in exported_patient['versions']], [1, 2]
+        )
+        self.assertEqual(exported_patient['versions'][0]['data']['name'], 'Zhang San')
+        self.assertEqual(exported_patient['versions'][0]['summary'], 'v1 intake')
+        self.assertEqual(exported_patient['versions'][1]['summary'], 'v2 demographics')
+
+        restored = RecordStore()
+        result = restored.import_bundle(exported)
+        self.assertEqual(result.accepted, 1)
+        restored_entity = restored.entities[EntityKey('hospital-a', 'patient', 'p-1')]
+        self.assertEqual(sorted(restored_entity.versions), [1, 2])
+        self.assertEqual(restored_entity.versions[1].data['name'], 'Zhang San')
+        self.assertEqual(restored_entity.versions[1].summary, 'v1 intake')
+        self.assertEqual(restored_entity.current_version, 2)
+        self.assertEqual(restored_entity.current.data['name'], 'Zhang San (updated)')
+        re_exported = export_bundle(restored)
+        self.assertEqual(
+            re_exported['entities'][0]['versions'],
+            exported_patient['versions'],
+        )
+
+    def test_incremental_reimport_is_idempotent_and_appends_only_new_versions(self):
+        exported = export_bundle(RecordStore())
+        first_store = RecordStore()
+        first_store.import_bundle(bundle(records=[
+            record('p-1', 'patient', 1, name='Zhang San'),
+            record('p-1', 'patient', 2, name='Zhang San II'),
+        ]))
+        snapshot = export_bundle(first_store)
+
+        target = RecordStore()
+        first = target.import_bundle(snapshot)
+        second = target.import_bundle(snapshot)
+        self.assertEqual((first.accepted, first.duplicate), (1, 0))
+        self.assertEqual((second.accepted, second.duplicate), (0, 1))
+        entity = target.entities[EntityKey('hospital-a', 'patient', 'p-1')]
+        self.assertEqual(sorted(entity.versions), [1, 2])
+
+        first_store.import_bundle(bundle(records=[
+            record('p-1', 'patient', 3, name='Zhang San III'),
+        ]))
+        grown = export_bundle(first_store)
+        third = target.import_bundle(grown)
+        self.assertEqual((third.accepted, third.duplicate), (1, 0))
+        self.assertEqual(
+            sorted(target.entities[EntityKey('hospital-a', 'patient', 'p-1')].versions),
+            [1, 2, 3],
+        )
+
+    def test_same_named_records_with_divergent_revisions_do_not_overwrite(self):
+        stores = {}
+        for source_id, v2_name in (('hospital-a', 'A only revision'), ('hospital-b', 'B only revision')):
+            source_store = RecordStore()
+            source_store.import_bundle(bundle(
+                source_id=source_id,
+                records=[record('p-1', 'patient', 1, name='Shared old name')],
+            ))
+            source_store.import_bundle(bundle(
+                source_id=source_id,
+                records=[record('p-1', 'patient', 2, name=v2_name)],
+            ))
+            stores[source_id] = source_store
+
+        target = RecordStore()
+        target.import_bundle(export_bundle(stores['hospital-a']))
+        target.import_bundle(export_bundle(stores['hospital-b']))
+        key_a = EntityKey('hospital-a', 'patient', 'p-1')
+        key_b = EntityKey('hospital-b', 'patient', 'p-1')
+        self.assertEqual(target.entities[key_a].versions[1].data['name'], 'Shared old name')
+        self.assertEqual(target.entities[key_a].current.data['name'], 'A only revision')
+        self.assertEqual(target.entities[key_b].versions[1].data['name'], 'Shared old name')
+        self.assertEqual(target.entities[key_b].current.data['name'], 'B only revision')
+
+    def test_interrupted_migration_resumes_and_restores_per_source_queries(self):
+        source_store = RecordStore()
+        source_store.import_bundle(bundle(records=[
+            record('p-1', 'patient', 1, name='Zhang San'),
+            record('p-1', 'patient', 2, name='Zhang San updated'),
+            record('e-a', 'encounter', 1, patient_ref='p-1'),
+        ]))
+        snapshot = export_bundle(source_store)
+        interrupted = dict(snapshot)
+        interrupted['entities'] = [snapshot['entities'][0]]
+
+        target = RecordStore()
+        target.import_bundle(interrupted)
+        target.import_bundle(snapshot)
+        target.import_bundle(snapshot)
+        key = EntityKey('hospital-a', 'patient', 'p-1')
+        self.assertEqual(sorted(target.entities[key].versions), [1, 2])
+        self.assertEqual(
+            [item.key.canonical_id() for item in target.patient_records(key)['encounters']],
+            ['hospital-a/encounter/e-a'],
+        )
+
+    def test_manual_decisions_reference_original_versions_and_survive_migration_and_revert(self):
+        source_store = RecordStore()
+        source_store.import_bundle(bundle(records=[
+            record('p-1', 'patient', 1, name='Zhang San'),
+            record('e-a', 'encounter', 1, patient_ref='p-1'),
+        ]))
+        source_store.import_bundle(bundle(source_id='hospital-b', records=[
+            record('x-7', 'patient', 1, name='Zhang San'),
+            record('x-7', 'patient', 2, name='Zhang San corrected'),
+            record('e-b', 'encounter', 1, patient_ref='x-7'),
+        ]))
+        source_store.merge_patients(
+            'hospital-a/patient/p-1',
+            'hospital-b/patient/x-7',
+            reason='checked wristband',
+            timestamp='2026-09-29T07:00:00Z',
+            operation_id='merge-history',
+        )
+        snapshot = export_bundle(source_store)
+        merge_data = next(
+            item for item in snapshot['identity_operations'] if item['id'] == 'merge-history'
+        )
+        self.assertEqual(
+            merge_data['patient_versions'],
+            {'hospital-a/patient/p-1': 1, 'hospital-b/patient/x-7': 2},
+        )
+
+        restored = RecordStore()
+        restored.import_bundle(snapshot)
+        self.assertEqual(
+            restored.canonical_patient('hospital-b/patient/x-7').canonical_id(),
+            'hospital-a/patient/p-1',
+        )
+        restored.revert_merge('merge-history', reason='distinct people')
+        records_a = restored.patient_records('hospital-a/patient/p-1')
+        records_b = restored.patient_records('hospital-b/patient/x-7')
+        self.assertEqual(
+            [item.key.canonical_id() for item in records_a['encounters']],
+            ['hospital-a/encounter/e-a'],
+        )
+        self.assertEqual(
+            [item.key.canonical_id() for item in records_b['encounters']],
+            ['hospital-b/encounter/e-b'],
+        )
+        reverted_entity = restored.entities[EntityKey('hospital-b', 'patient', 'x-7')]
+        self.assertEqual(sorted(reverted_entity.versions), [1, 2])
+        self.assertEqual(reverted_entity.current.data['name'], 'Zhang San corrected')
+
 
 if __name__ == "__main__":
     unittest.main()

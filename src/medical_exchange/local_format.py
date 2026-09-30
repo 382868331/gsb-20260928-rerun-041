@@ -52,7 +52,7 @@ def source_from_bundle(bundle: dict[str, Any]) -> Source:
     return Source(id=source["id"], name=name or "")
 
 
-def validate_record(record: Any) -> tuple[str, str, int, dict[str, Any]]:
+def validate_record(record: Any) -> tuple[str, str, int, dict[str, Any], str]:
     if not isinstance(record, dict):
         raise ValidationError("record must be an object")
     record_id = record.get("id")
@@ -79,7 +79,12 @@ def validate_record(record: Any) -> tuple[str, str, int, dict[str, Any]]:
         if not _nonempty_string(data.get("code")):
             raise ValidationError("observation data.code is required")
 
-    return record_id, entity_type, version, data
+    summary = record.get("summary", "")
+    if summary is None:
+        summary = ""
+    if not isinstance(summary, str):
+        raise ValidationError("record summary must be a string when present")
+    return record_id, entity_type, version, data, summary
 
 
 def _require_name(data: dict[str, Any]) -> None:

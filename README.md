@@ -48,6 +48,9 @@ after a newer current version are rejected.
 `export_bundle(store)` returns `unified.records.v1` with sources, current entity
 data, retained version hashes, resolved relationships, pending relationships,
 manual identity operations, and the current patient identity groups.
+Each entity carries its **full** version history — every version's original
+`data` and optional `summary`, not only the latest content hash — so exporting
+and importing into a new store restores old revision contents verbatim.
 This makes patient → encounter → observation links explicit and allows their
 correspondence to be checked after export. Each relationship retains its exact
 source-local target in `original_target_entity`; when that patient belongs to a
@@ -88,6 +91,26 @@ original source-patient ownership.
 `unified.records.v1` is also importable. Importing an exported bundle into a new
 `RecordStore` restores the current entities, references, pending links, identity
 groups, merge operations, and withdrawal evidence.
+
+## Incremental Migration
+
+Re-importing the same `unified.records.v1` bundle is idempotent: versions whose
+content hashes already exist are reported as `duplicate`, and only genuinely new
+versions are appended. A migration can therefore be interrupted and resumed by
+replaying the same bundle, or grown over time by exporting newer snapshots —
+later snapshots only add versions the target store does not yet have. Historical
+versions arriving out of numeric order are retained as history and never
+overwrite or downgrade the current view.
+
+Records are always keyed by `(source.id, type, record.id)`, so two sources that
+happen to use the same local id and name, or revise in different orders, remain
+independent histories and can never overwrite each other.
+
+Each merge and withdrawal records `patient_versions`: the exact source-local
+record version each patient had at the time the human decision was made. After
+migration and a later `revert_merge`, encounters and observations return to
+their original source-patient ownership and per-source historical queries match
+the source store, with every source revision still present.
 
 Run tests with:
 

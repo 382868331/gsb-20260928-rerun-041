@@ -75,8 +75,10 @@ class RecordStore:
         for raw_record in bundle["records"]:
             record_id = raw_record.get("id") if isinstance(raw_record, dict) else None
             try:
-                local_id, entity_type, version, data = validate_record(raw_record)
-                outcome = self._put_version(source.id, local_id, entity_type, version, data)
+                local_id, entity_type, version, data, summary = validate_record(raw_record)
+                outcome = self._put_version(
+                    source.id, local_id, entity_type, version, data, summary=summary
+                )
             except (ValueError, TypeError) as exc:
                 result.rejected += 1
                 result.failures.append(RecordFailure(record_id, str(exc)))
@@ -137,6 +139,7 @@ class RecordStore:
             reason=reason,
             operator=operator,
             previous_groups=previous_groups,
+            patient_versions=self._patient_versions(first, second),
         )
         self.identity_operations.append(operation)
         self._replay_identity_groups()
@@ -176,6 +179,7 @@ class RecordStore:
             operator=operator,
             previous_groups=dict(merge.previous_groups),
             reverts=merge_operation_id,
+            patient_versions=self._patient_versions(*merge.patients),
         )
         self.identity_operations.append(operation)
         self._replay_identity_groups()
@@ -260,6 +264,8 @@ class RecordStore:
         entity_type: str,
         version: int,
         data: dict[str, Any],
+        *,
+        summary: str = "",
     ) -> str:
         key = EntityKey(source_id, entity_type, local_id)
         content_hash = _content_hash(data)
@@ -269,7 +275,7 @@ class RecordStore:
             self.entities[key] = Entity(
                 key=key,
                 current_version=version,
-                versions={version: Version(version, data, content_hash)},
+                versions={version: Version(version, data, content_hash, summary)},
             )
             return "accepted"
 
@@ -287,9 +293,131 @@ class RecordStore:
                 f"{entity.current_version}"
             )
 
-        entity.versions[version] = Version(version, data, content_hash)
+        entity.versions[version] = Version(version, data, content_hash, summary)
         entity.current_version = version
         return "accepted"
+
+    def _restore_history(
+        self,
+        source_id: str,
+        local_id: str,
+        entity_type: str,
+        current_version: int,
+        data: dict[str, Any],
+        version_entries: Any,
+        *,
+        declared_hash: str | None,
+        summary: str = "",
+    ) -> str:
+        """Restore a complete version history from a unified bundle.
+
+        Incremental and idempotent: versions already present with identical
+        content are duplicates, genuinely new versions are appended, and older
+        versions arriving out of order are retained as history instead of
+        overwriting or rejecting the current view.
+        """
+        key = EntityKey(source_id, entity_type, local_id)
+        ordered: list[tuple[int, dict[str, Any], str | None, str]] = []
+        full_entries = (
+            isinstance(version_entries, list)
+            and len(version_entries) > 0
+            and all(
+                isinstance(entry, dict)
+                for entry in version_entries
+            )
+            and all(isinstance(entry.get("data"), dict) for entry in version_entries)
+        )
+        if full_entries:
+            try:
+                seen = set()
+                for entry in version_entries:
+                    if not isinstance(entry, dict):
+                        raise ValueError("version entries must be objects")
+                    entry_version = entry.get("version")
+                    entry_data = entry.get("data")
+                    if (
+                        not isinstance(entry_version, int)
+                        or isinstance(entry_version, bool)
+                        or entry_version < 1
+                    ):
+                        raise ValueError("version entry version must be a positive integer")
+                    if not isinstance(entry_data, dict):
+                        raise ValueError("version entry data must be an object")
+                    if entry_version in seen:
+                        raise ValueError(
+                            f"{entity_type} {local_id!r} lists version {entry_version} more than once"
+                        )
+                    seen.add(entry_version)
+                    entry_hash = entry.get("content_hash")
+                    if entry_hash is not None and not isinstance(entry_hash, str):
+                        raise ValueError("version entry content_hash must be a string")
+                    entry_summary = entry.get("summary", "") or ""
+                    if not isinstance(entry_summary, str):
+                        raise ValueError("version entry summary must be a string")
+                    ordered.append((entry_version, entry_data, entry_hash, entry_summary))
+            except ValueError:
+                ordered = []
+
+        if not ordered:
+            ordered = [
+                (
+                    current_version,
+                    data,
+                    declared_hash,
+                    summary,
+                )
+            ]
+
+        if not any(item[0] == current_version for item in ordered):
+            ordered.append((current_version, data, declared_hash, summary))
+        ordered.sort(key=lambda item: item[0])
+        highest = max(version for version, _, _, _ in ordered)
+        if highest != current_version:
+            raise ValueError(
+                f"{entity_type} {local_id!r} current_version {current_version} does not match "
+                f"highest historical version {highest}"
+            )
+
+        entity = self.entities.get(key)
+        added = False
+        for version, entry_data, entry_hash, entry_summary in ordered:
+            actual_hash = _content_hash(entry_data)
+            if entry_hash is not None and entry_hash != actual_hash:
+                raise ValueError(
+                    f"{entity_type} {local_id!r} version {version} content_hash does not match data"
+                )
+            if entity is None:
+                entity = Entity(
+                    key=key,
+                    current_version=version,
+                    versions={version: Version(version, entry_data, actual_hash, entry_summary)},
+                )
+                self.entities[key] = entity
+                added = True
+                continue
+            existing = entity.versions.get(version)
+            if existing is not None:
+                if existing.content_hash != actual_hash:
+                    raise ValueError(
+                        f"{entity_type} {local_id!r} version {version} has conflicting content"
+                    )
+                continue
+            entity.versions[version] = Version(version, entry_data, actual_hash, entry_summary)
+            added = True
+            if version > entity.current_version:
+                entity.current_version = version
+
+        if entity is not None:
+            entity.current_version = max(entity.versions)
+        return "accepted" if added else "duplicate"
+
+    def _patient_versions(self, *patients: EntityKey) -> dict[str, int]:
+        versions = {}
+        for patient in patients:
+            entity = self.entities.get(patient)
+            if entity is not None:
+                versions[patient.canonical_id()] = entity.current_version
+        return versions
 
     def _rebuild_references(self, source_id: str) -> tuple[int, int]:
         affected = {
@@ -344,12 +472,19 @@ class RecordStore:
                         item.get("source", {}).get("name", "") or "",
                     ),
                 )
-                outcome = self._put_version(
+                current_version = int(item["current_version"])
+                declared_hash = item.get("content_hash")
+                if declared_hash is not None and not isinstance(declared_hash, str):
+                    raise ValueError("entity content_hash must be a string")
+                outcome = self._restore_history(
                     key.source_id,
                     key.source_record_id,
                     key.entity_type,
-                    int(item["current_version"]),
+                    current_version,
                     data,
+                    item.get("versions"),
+                    declared_hash=declared_hash,
+                    summary=item.get("summary", "") or "",
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 result.rejected += 1
@@ -382,6 +517,16 @@ class RecordStore:
         if not isinstance(operation_id, str) or any(item.id == operation_id for item in self.identity_operations):
             return
         patients = tuple(self._entity_key_from_id(item, "patient") for item in raw.get("patients", []))
+        raw_patient_versions = raw.get("patient_versions", {})
+        patient_versions: dict[str, int] = {}
+        if isinstance(raw_patient_versions, dict):
+            for version_key, version_number in raw_patient_versions.items():
+                if (
+                    isinstance(version_key, str)
+                    and isinstance(version_number, int)
+                    and not isinstance(version_number, bool)
+                ):
+                    patient_versions[version_key] = version_number
         operation = IdentityOperation(
             id=operation_id,
             operation=raw.get("operation", ""),
@@ -397,6 +542,7 @@ class RecordStore:
             operator=raw.get("operator", ""),
             previous_groups=dict(raw.get("previous_groups", {})),
             reverts=raw.get("reverts", ""),
+            patient_versions=patient_versions,
         )
         self.identity_operations.append(operation)
         self._replay_identity_groups()
