@@ -127,6 +127,10 @@ class RecordStore:
             key.canonical_id(): self.patient_groups[key]
             for key in (first, second)
         }
+        patient_versions = {
+            key.canonical_id(): self.entities[key].current_version
+            for key in (first, second)
+        }
         operation = IdentityOperation(
             id=operation_id,
             operation="merge",
@@ -137,6 +141,7 @@ class RecordStore:
             reason=reason,
             operator=operator,
             previous_groups=previous_groups,
+            patient_versions=patient_versions,
         )
         self.identity_operations.append(operation)
         self._replay_identity_groups()
@@ -176,6 +181,7 @@ class RecordStore:
             operator=operator,
             previous_groups=dict(merge.previous_groups),
             reverts=merge_operation_id,
+            patient_versions=dict(merge.patient_versions),
         )
         self.identity_operations.append(operation)
         self._replay_identity_groups()
@@ -291,6 +297,43 @@ class RecordStore:
         entity.current_version = version
         return "accepted"
 
+    def _restore_version(
+        self,
+        source_id: str,
+        local_id: str,
+        entity_type: str,
+        version: int,
+        data: dict[str, Any],
+        expected_hash: str | None = None,
+    ) -> str:
+        key = EntityKey(source_id, entity_type, local_id)
+        content_hash = _content_hash(data)
+        if expected_hash is not None and expected_hash != content_hash:
+            raise ConflictError(
+                f"{entity_type} {local_id!r} version {version} has an invalid content hash"
+            )
+        entity = self.entities.get(key)
+
+        if entity is None:
+            self.entities[key] = Entity(
+                key=key,
+                current_version=version,
+                versions={version: Version(version, data, content_hash)},
+            )
+            return "accepted"
+
+        existing = entity.versions.get(version)
+        if existing is not None:
+            if existing.content_hash == content_hash:
+                return "duplicate"
+            raise ConflictError(
+                f"{entity_type} {local_id!r} version {version} has conflicting content"
+            )
+
+        entity.versions[version] = Version(version, data, content_hash)
+        entity.current_version = max(entity.current_version, version)
+        return "accepted"
+
     def _rebuild_references(self, source_id: str) -> tuple[int, int]:
         affected = {
             ref
@@ -334,9 +377,6 @@ class RecordStore:
             entity_id = item.get("id") if isinstance(item, dict) else None
             try:
                 key = self._entity_key_from_id(item["id"], item["type"])
-                data = item["data"]
-                if not isinstance(data, dict):
-                    raise ValueError("entity data must be an object")
                 self.sources.setdefault(
                     key.source_id,
                     Source(
@@ -344,21 +384,22 @@ class RecordStore:
                         item.get("source", {}).get("name", "") or "",
                     ),
                 )
-                outcome = self._put_version(
-                    key.source_id,
-                    key.source_record_id,
-                    key.entity_type,
-                    int(item["current_version"]),
-                    data,
-                )
+                outcomes = [self._restore_unified_entity_version(key, item)]
+                current_version = int(item.get("current_version", item.get("version")))
+                for historical in item.get("versions", []):
+                    if not isinstance(historical, dict):
+                        raise ValueError("entity version entries must be objects")
+                    if "data" not in historical:
+                        continue
+                    if int(historical["version"]) == current_version:
+                        continue
+                    outcomes.append(self._restore_unified_entity_version(key, historical))
             except (KeyError, TypeError, ValueError) as exc:
                 result.rejected += 1
                 result.failures.append(RecordFailure(entity_id, str(exc)))
                 continue
-            if outcome == "duplicate":
-                result.duplicate += 1
-            else:
-                result.accepted += 1
+            result.accepted += sum(outcome == "accepted" for outcome in outcomes)
+            result.duplicate += sum(outcome == "duplicate" for outcome in outcomes)
 
         for raw_operation in bundle.get("identity_operations", []):
             self._import_identity_operation(raw_operation)
@@ -397,9 +438,32 @@ class RecordStore:
             operator=raw.get("operator", ""),
             previous_groups=dict(raw.get("previous_groups", {})),
             reverts=raw.get("reverts", ""),
+            patient_versions={
+                str(patient_id): int(version)
+                for patient_id, version in raw.get("patient_versions", {}).items()
+            },
         )
         self.identity_operations.append(operation)
         self._replay_identity_groups()
+
+    def _restore_unified_entity_version(self, key: EntityKey, item: dict[str, Any]) -> str:
+        data = item.get("data")
+        if not isinstance(data, dict):
+            raise ValueError("entity version data must be an object")
+        version = int(item.get("version", item.get("current_version")))
+        if version < 1:
+            raise ValueError("entity version must be a positive integer")
+        expected_hash = item.get("content_hash")
+        if expected_hash is not None and not isinstance(expected_hash, str):
+            raise ValueError("entity content_hash must be a string")
+        return self._restore_version(
+            key.source_id,
+            key.source_record_id,
+            key.entity_type,
+            version,
+            data,
+            expected_hash,
+        )
 
     def _replay_identity_groups(self) -> None:
         patient_keys = {key for key in self.entities if key.entity_type == "patient"}

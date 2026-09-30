@@ -319,6 +319,107 @@ class ExchangeTests(unittest.TestCase):
         self.assertEqual(re_exported['identity_operations'], exported['identity_operations'])
         self.assertEqual(re_exported['patient_identity_groups'], exported['patient_identity_groups'])
 
+    def test_unified_migration_preserves_full_history_and_decision_versions(self):
+        source_store = RecordStore()
+        source_store.import_bundle(bundle(records=[
+            record('p-1', 'patient', 1, name='Zhang San'),
+            record('p-1', 'patient', 2, name='Zhang San Jr.'),
+        ]))
+        source_store.import_bundle(bundle(source_id='hospital-b', records=[
+            record('p-1', 'patient', 1, name='Zhang San Original'),
+            record('p-1', 'patient', 2, name='Zhang San'),
+        ]))
+
+        source_store.merge_patients(
+            'hospital-a/patient/p-1',
+            'hospital-b/patient/p-1',
+            reason='verified across source systems',
+            timestamp='2026-09-29T07:00:00Z',
+            operation_id='merge-history',
+        )
+        exported = export_bundle(source_store)
+
+        restored = RecordStore()
+        first_import = restored.import_bundle(exported)
+        second_import = restored.import_bundle(exported)
+
+        self.assertEqual((first_import.accepted, first_import.duplicate), (4, 0))
+        self.assertEqual((second_import.accepted, second_import.duplicate), (0, 4))
+
+        hospital_a = EntityKey('hospital-a', 'patient', 'p-1')
+        hospital_b = EntityKey('hospital-b', 'patient', 'p-1')
+        self.assertEqual(
+            restored.entities[hospital_a].versions[1].data['name'],
+            'Zhang San',
+        )
+        self.assertEqual(
+            restored.entities[hospital_b].versions[1].data['name'],
+            'Zhang San Original',
+        )
+        self.assertEqual(restored.entities[hospital_b].current_version, 2)
+
+        merge = next(
+            item for item in restored.identity_operations if item.id == 'merge-history'
+        )
+        self.assertEqual(
+            merge.patient_versions,
+            {'hospital-a/patient/p-1': 2, 'hospital-b/patient/p-1': 2},
+        )
+
+        restored.revert_merge(
+            'merge-history',
+            reason='sources disagreed on revision evidence',
+            timestamp='2026-09-29T08:00:00Z',
+            operation_id='revert-history',
+        )
+        self.assertEqual(
+            restored.patient_group('hospital-a/patient/p-1'),
+            [hospital_a],
+        )
+        self.assertEqual(
+            restored.patient_group('hospital-b/patient/p-1'),
+            [hospital_b],
+        )
+        self.assertEqual(
+            export_bundle(restored)['entities'],
+            exported['entities'],
+        )
+
+    def test_unified_import_appends_only_new_versions_after_interrupted_migration(self):
+        source_store = RecordStore()
+        source_store.import_bundle(bundle(records=[
+            record('p-1', 'patient', 1, name='V1'),
+            record('p-1', 'patient', 3, name='V3'),
+        ]))
+        exported = export_bundle(source_store)
+
+        restored = RecordStore()
+        partial = {
+            **exported,
+            'entities': [
+                {
+                    **exported['entities'][0],
+                    'versions': [
+                        {
+                            'version': version['version'],
+                            'content_hash': version['content_hash'],
+                        }
+                        for version in exported['entities'][0]['versions']
+                    ],
+                }
+            ],
+            'identity_operations': [],
+        }
+        partial_result = restored.import_bundle(partial)
+        resumed_result = restored.import_bundle(exported)
+
+        self.assertEqual(partial_result.accepted, 1)
+        self.assertEqual(resumed_result.accepted, 1)
+        self.assertEqual(resumed_result.duplicate, 1)
+        key = EntityKey('hospital-a', 'patient', 'p-1')
+        self.assertEqual(restored.entities[key].current_version, 3)
+        self.assertEqual(restored.entities[key].versions[1].data['name'], 'V1')
+
 
 if __name__ == "__main__":
     unittest.main()

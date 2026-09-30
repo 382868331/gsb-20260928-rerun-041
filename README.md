@@ -46,8 +46,9 @@ after a newer current version are rejected.
 ## Export
 
 `export_bundle(store)` returns `unified.records.v1` with sources, current entity
-data, retained version hashes, resolved relationships, pending relationships,
-manual identity operations, and the current patient identity groups.
+data, every retained historical version (including its full data and content
+hash), resolved relationships, pending relationships, manual identity
+operations, and the current patient identity groups.
 This makes patient → encounter → observation links explicit and allows their
 correspondence to be checked after export. Each relationship retains its exact
 source-local target in `original_target_entity`; when that patient belongs to a
@@ -82,12 +83,18 @@ store.revert_merge(merge_operation_id, reason="found distinct birth dates")
 
 The merge and the withdrawal are both retained in `identity_operations` with
 their operation ids, timestamps, reasons, operators, affected patients, and
-group evidence. After withdrawal, encounters and observations return to their
-original source-patient ownership.
+group evidence. Each operation also records the exact source-patient versions
+to which the human decision applied; withdrawal retains the original merge
+version evidence. After withdrawal, encounters and observations return to
+their original source-patient ownership.
 
 `unified.records.v1` is also importable. Importing an exported bundle into a new
-`RecordStore` restores the current entities, references, pending links, identity
-groups, merge operations, and withdrawal evidence.
+`RecordStore` restores all historical versions, entities, references, pending
+links, identity groups, merge operations, and withdrawal evidence. Re-importing
+the same bundle is idempotent: exact versions are reported as duplicates, while
+only genuinely new versions are appended. Historical snapshots may arrive out
+of revision order; migration fills missing old versions without changing the
+highest current version.
 
 Run tests with:
 

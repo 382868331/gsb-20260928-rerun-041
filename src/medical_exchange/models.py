@@ -63,3 +63,4 @@ class IdentityOperation:
     operator: str = ""
     previous_groups: dict[str, str] = field(default_factory=dict)
     reverts: str = ""
+    patient_versions: dict[str, int] = field(default_factory=dict)

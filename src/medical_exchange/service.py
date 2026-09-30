@@ -27,7 +27,11 @@ def export_bundle(store: "RecordStore") -> dict[str, Any]:
                 "current_version": entity.current_version,
                 "data": entity.current.data,
                 "versions": [
-                    {"version": item.version, "content_hash": item.content_hash}
+                    {
+                        "version": item.version,
+                        "content_hash": item.content_hash,
+                        "data": item.data,
+                    }
                     for _, item in sorted(entity.versions.items())
                 ],
             }
@@ -121,6 +125,7 @@ def _identity_operation(operation: Any) -> dict[str, Any]:
         "reason": operation.reason,
         "operator": operation.operator,
         "previous_groups": dict(operation.previous_groups),
+        "patient_versions": dict(operation.patient_versions),
     }
     if operation.canonical_patient is not None:
         data["canonical_patient"] = operation.canonical_patient.canonical_id()
