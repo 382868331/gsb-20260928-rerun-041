@@ -7,7 +7,9 @@ from typing import Any
 from .exceptions import ImportFormatError, ValidationError
 from .models import Source
 
-FORMAT = "medlocal.v1"
+MEDLOCAL_FORMAT = "medlocal.v1"
+UNIFIED_FORMAT = "unified.records.v1"
+FORMAT = MEDLOCAL_FORMAT
 ENTITY_TYPES = {"patient", "encounter", "observation"}
 
 
@@ -27,14 +29,19 @@ def parse_file(path: str | Path) -> dict[str, Any]:
 def validate_envelope(bundle: Any) -> None:
     if not isinstance(bundle, dict):
         raise ImportFormatError("exchange bundle must be an object")
-    if bundle.get("format") != FORMAT:
-        raise ImportFormatError(f"unsupported format; expected {FORMAT!r}")
-    source = bundle.get("source")
-    if not isinstance(source, dict) or not _nonempty_string(source.get("id")):
-        raise ImportFormatError("source.id is required and must be a non-empty string")
-    records = bundle.get("records")
-    if not isinstance(records, list):
-        raise ImportFormatError("records must be a list")
+    bundle_format = bundle.get("format")
+    if bundle_format not in (MEDLOCAL_FORMAT, UNIFIED_FORMAT):
+        raise ImportFormatError(
+            f"unsupported format; expected {MEDLOCAL_FORMAT!r} or {UNIFIED_FORMAT!r}"
+        )
+    if bundle_format == MEDLOCAL_FORMAT:
+        source = bundle.get("source")
+        if not isinstance(source, dict) or not _nonempty_string(source.get("id")):
+            raise ImportFormatError("source.id is required and must be a non-empty string")
+    if bundle_format == MEDLOCAL_FORMAT:
+        records = bundle.get("records")
+        if not isinstance(records, list):
+            raise ImportFormatError("records must be a list")
 
 
 def source_from_bundle(bundle: dict[str, Any]) -> Source:
@@ -88,4 +95,3 @@ def _require_local_ref(data: dict[str, Any], field_name: str) -> None:
 
 def _nonempty_string(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
-

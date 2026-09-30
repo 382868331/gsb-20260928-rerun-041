@@ -46,9 +46,48 @@ after a newer current version are rejected.
 ## Export
 
 `export_bundle(store)` returns `unified.records.v1` with sources, current entity
-data, retained version hashes, resolved relationships, and pending relationships.
+data, retained version hashes, resolved relationships, pending relationships,
+manual identity operations, and the current patient identity groups.
 This makes patient → encounter → observation links explicit and allows their
-correspondence to be checked after export.
+correspondence to be checked after export. Each relationship retains its exact
+source-local target in `original_target_entity`; when that patient belongs to a
+manual group, `canonical_target_entity` provides the group's canonical patient.
+
+## Manual Patient Identity
+
+Patient identity is never inferred from names. A confirmed link is an explicit
+manual operation:
+
+```python
+store.merge_patients(
+    "hospital-a/patient/p-1",
+    "hospital-b/patient/x-7",
+    reason="insurance card and wristband checked",
+    operator="clerk-12",
+)
+```
+
+Both source records remain independent entities with their own source-local ids,
+versions, and original data. `patient_records(patient_id)` queries encounters and
+observations through the current identity group, including records that arrive
+after the merge. A later higher source version updates that source's own record
+but never silently removes or rewrites the manual merge decision; import results
+report the preserved decision count as `manual_decisions_preserved`.
+
+A wrong merge can be withdrawn:
+
+```python
+store.revert_merge(merge_operation_id, reason="found distinct birth dates")
+```
+
+The merge and the withdrawal are both retained in `identity_operations` with
+their operation ids, timestamps, reasons, operators, affected patients, and
+group evidence. After withdrawal, encounters and observations return to their
+original source-patient ownership.
+
+`unified.records.v1` is also importable. Importing an exported bundle into a new
+`RecordStore` restores the current entities, references, pending links, identity
+groups, merge operations, and withdrawal evidence.
 
 Run tests with:
 

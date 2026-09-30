@@ -50,3 +50,16 @@ class PendingReference:
     target_type: str
     target: EntityKey
 
+
+@dataclass(frozen=True)
+class IdentityOperation:
+    id: str
+    operation: str
+    timestamp: str
+    patients: tuple[EntityKey, ...]
+    group_id: str
+    canonical_patient: EntityKey | None = None
+    reason: str = ""
+    operator: str = ""
+    previous_groups: dict[str, str] = field(default_factory=dict)
+    reverts: str = ""

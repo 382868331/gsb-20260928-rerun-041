@@ -42,13 +42,19 @@ def export_bundle(store: "RecordStore") -> dict[str, Any]:
             target_key = EntityKey(
                 key.source_id, target_type, entity.current.data[field_name]
             )
+            status = "resolved" if target_key in store.entities else "pending"
+            effective_target = target_key
+            if target_type == "patient" and target_key in store.patient_groups:
+                effective_target = store.canonical_patient(target_key)
             relationships.append(
                 {
                     "source_entity": key.canonical_id(),
                     "field": field_name,
                     "target_type": target_type,
                     "target_entity": target_key.canonical_id(),
-                    "status": "resolved" if target_key in store.entities else "pending",
+                    "original_target_entity": target_key.canonical_id(),
+                    "canonical_target_entity": effective_target.canonical_id(),
+                    "status": status,
                 }
             )
 
@@ -63,6 +69,8 @@ def export_bundle(store: "RecordStore") -> dict[str, Any]:
         ],
         "entities": entities,
         "relationships": relationships,
+        "patient_identity_groups": _identity_groups(store),
+        "identity_operations": [_identity_operation(item) for item in store.identity_operations],
         "pending_relationships": [
             {
                 "source_entity": ref.source_entity,
@@ -76,3 +84,46 @@ def export_bundle(store: "RecordStore") -> dict[str, Any]:
             )
         ],
     }
+
+
+def _identity_groups(store: "RecordStore") -> list[dict[str, Any]]:
+    grouped: dict[str, list[EntityKey]] = {}
+    for key, group_id in store.patient_groups.items():
+        grouped.setdefault(group_id, []).append(key)
+    result = []
+    for group_id, members in sorted(grouped.items()):
+        ordered = sorted(members, key=lambda item: item.canonical_id())
+        canonical = next(
+            (
+                key
+                for key in ordered
+                if store.canonical_patient(key).canonical_id() == key.canonical_id()
+            ),
+            ordered[0],
+        )
+        result.append(
+            {
+                "id": group_id,
+                "canonical_patient": canonical.canonical_id(),
+                "patients": [key.canonical_id() for key in ordered],
+            }
+        )
+    return result
+
+
+def _identity_operation(operation: Any) -> dict[str, Any]:
+    data = {
+        "id": operation.id,
+        "operation": operation.operation,
+        "timestamp": operation.timestamp,
+        "patients": [key.canonical_id() for key in operation.patients],
+        "group_id": operation.group_id,
+        "reason": operation.reason,
+        "operator": operation.operator,
+        "previous_groups": dict(operation.previous_groups),
+    }
+    if operation.canonical_patient is not None:
+        data["canonical_patient"] = operation.canonical_patient.canonical_id()
+    if operation.reverts:
+        data["reverts"] = operation.reverts
+    return data

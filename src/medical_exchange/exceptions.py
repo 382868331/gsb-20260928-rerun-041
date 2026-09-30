@@ -9,3 +9,6 @@ class ValidationError(ValueError):
 class ConflictError(ValueError):
     """Raised when an incoming version conflicts with stored history."""
 
+
+class IdentityError(ValueError):
+    """Raised when a manual patient identity operation is invalid."""
