@@ -13,7 +13,7 @@ __all__ = [
     "export_bundle",
     "import_bundle",
     "import_file",
+    "import_unified_bundle",
 ]
 
-from .service import export_bundle
-
+from .service import export_bundle, import_unified_bundle

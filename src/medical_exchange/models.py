@@ -50,3 +50,22 @@ class PendingReference:
     target_type: str
     target: EntityKey
 
+
+@dataclass(frozen=True)
+class IdentityDecision:
+    """A human identity judgement that source data must never silently overwrite.
+
+    ``action`` is either ``merge`` or ``unmerge``. ``members`` always holds the
+    complete set of patient canonical ids that the merge applied to; an unmerge
+    repeats them so the operation basis is self-contained.
+    """
+
+    decision_id: int
+    action: Literal["merge", "unmerge"]
+    group_id: str
+    members: tuple[str, ...]
+    reason: str
+    operator: str
+    decided_at: str
+    supersedes: int | None = None
+    evidence: tuple[dict[str, Any], ...] = ()
