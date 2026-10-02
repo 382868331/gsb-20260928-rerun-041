@@ -64,3 +64,64 @@ class IdentityOperation:
     previous_groups: dict[str, str] = field(default_factory=dict)
     reverts: str = ""
     patient_versions: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class WithdrawalNotice:
+    id: str
+    source_id: str
+    entity_type: str
+    source_record_id: str
+    version: int
+    received_at: str
+    reason: str = ""
+    operator: str = ""
+    status: str = "pending"
+    verified_at: str = ""
+
+    @property
+    def key(self) -> EntityKey:
+        return EntityKey(self.source_id, self.entity_type, self.source_record_id)
+
+    @property
+    def target_entity(self) -> str:
+        return self.key.canonical_id()
+
+
+@dataclass(frozen=True)
+class VersionStatusEvent:
+    id: str
+    notice_id: str
+    source_id: str
+    entity_type: str
+    source_record_id: str
+    version: int
+    event: str
+    timestamp: str
+    reason: str = ""
+    operator: str = ""
+
+    @property
+    def key(self) -> EntityKey:
+        return EntityKey(self.source_id, self.entity_type, self.source_record_id)
+
+
+@dataclass(frozen=True)
+class ResearchExport:
+    id: str
+    timestamp: str
+    selected_versions: dict[str, int] = field(default_factory=dict)
+    description: str = ""
+    operator: str = ""
+    restrictions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class WithdrawalDecision:
+    id: str
+    notice_id: str
+    affected_context: str
+    action: str
+    timestamp: str
+    reason: str = ""
+    operator: str = ""

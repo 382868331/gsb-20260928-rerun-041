@@ -42,6 +42,9 @@ def validate_envelope(bundle: Any) -> None:
         records = bundle.get("records")
         if not isinstance(records, list):
             raise ImportFormatError("records must be a list")
+        withdrawal_notices = bundle.get("withdrawal_notices", [])
+        if not isinstance(withdrawal_notices, list):
+            raise ImportFormatError("withdrawal_notices must be a list")
 
 
 def source_from_bundle(bundle: dict[str, Any]) -> Source:

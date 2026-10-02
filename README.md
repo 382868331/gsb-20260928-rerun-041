@@ -96,6 +96,59 @@ only genuinely new versions are appended. Historical snapshots may arrive out
 of revision order; migration fills missing old versions without changing the
 highest current version.
 
+## Source Withdrawals
+
+A withdrawal notification points at one exact source version using the source id,
+entity type, source-local record id, and positive version number. Notifications
+can be received before the referenced material, repeatedly, or after later
+versions. A notice whose version has not arrived remains in
+`withdrawal_notices` with status `pending`; when the exact target later arrives,
+the store records a `withdrawn` `version_status_event` and changes the notice to
+`verified`. Repeated notifications are duplicates and never create a second
+event. Because the target includes the source id, a same-name record from another
+source is never withdrawn.
+
+```json
+{
+  "format": "medlocal.v1",
+  "source": {"id": "hospital-a", "name": "Hospital A"},
+  "records": [],
+  "withdrawal_notices": [
+    {
+      "id": "notice-42",
+      "type": "observation",
+      "record_id": "obs-9",
+      "version": 3,
+      "reason": "source laboratory retracted result",
+      "received_at": "2026-10-01T08:00:00Z"
+    }
+  ]
+}
+```
+
+The withdrawn payload and the notification fact are both retained. Entity
+history continues to include the full withdrawn data with per-version status;
+`current_valid_records()` and the top-level `data` in a fresh export use the
+highest non-withdrawn version instead. If every retained version is withdrawn,
+the entity is absent from current valid material and the export carries an
+explicit restriction rather than deleting the history. `entity_history()`
+returns the retained version timeline and `version_timeline()` follows each
+source status event.
+
+Manual merges record the exact patient versions seen by the reviewer. Research
+exports are created with `create_research_export(selected_versions)` and may not
+select an already withdrawn version. If a selected version is withdrawn later,
+`withdrawal_impacts()` lists the affected merge or research export without
+automatically changing it. A user resolves each item with either:
+
+- `reselect`: replace the material used for the research result.
+- `retain_limited_history`: keep the old result with an explicit restriction.
+
+Unified export and re-import carry notices, pending verification state, status
+events, research exports, user decisions, and impacts. Re-running an interrupted
+migration reports repeated versions/notices as duplicates and does not create a
+second withdrawal state change.
+
 Run tests with:
 
 ```bash

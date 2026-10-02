@@ -18,6 +18,8 @@ def export_bundle(store: "RecordStore") -> dict[str, Any]:
     for key in sorted(store.entities, key=lambda item: item.canonical_id()):
         entity = store.entities[key]
         source = store.sources.get(key.source_id)
+        effective_version = store.effective_current_version(key)
+        effective_data = entity.versions[effective_version].data if effective_version is not None else None
         entities.append(
             {
                 "id": key.canonical_id(),
@@ -25,12 +27,30 @@ def export_bundle(store: "RecordStore") -> dict[str, Any]:
                 "source": {"id": key.source_id, "name": source.name if source else ""},
                 "source_record_id": key.source_record_id,
                 "current_version": entity.current_version,
-                "data": entity.current.data,
+                "effective_current_version": effective_version,
+                "data": effective_data,
+                "status": (
+                    "withdrawn"
+                    if effective_version is None or store.is_version_withdrawn(key, entity.current_version)
+                    else "active"
+                ),
+                "current_version_status": (
+                    "withdrawn"
+                    if store.is_version_withdrawn(key, entity.current_version)
+                    else "active"
+                ),
+                "restrictions": (
+                    [f"current source version {entity.current_version} is withdrawn; effective version is {effective_version}"]
+                    if effective_version is not None and store.is_version_withdrawn(key, entity.current_version)
+                    else ["all retained versions are withdrawn"] if effective_version is None else []
+                ),
+                "withdrawn_versions": sorted(store.withdrawn_versions(key)),
                 "versions": [
                     {
                         "version": item.version,
                         "content_hash": item.content_hash,
                         "data": item.data,
+                        "status": "withdrawn" if store.is_version_withdrawn(key, item.version) else "active",
                     }
                     for _, item in sorted(entity.versions.items())
                 ],
@@ -41,12 +61,18 @@ def export_bundle(store: "RecordStore") -> dict[str, Any]:
             ("patient_ref", "patient"),
             ("encounter_ref", "encounter"),
         ):
-            if field_name not in entity.current.data:
+            if effective_data is None or field_name not in effective_data:
                 continue
             target_key = EntityKey(
-                key.source_id, target_type, entity.current.data[field_name]
+                key.source_id, target_type, effective_data[field_name]
             )
-            status = "resolved" if target_key in store.entities else "pending"
+            target_entity = store.entities.get(target_key)
+            if target_entity is None:
+                status = "pending"
+            elif store.effective_current_version(target_key) is None:
+                status = "withdrawn"
+            else:
+                status = "resolved"
             effective_target = target_key
             if target_type == "patient" and target_key in store.patient_groups:
                 effective_target = store.canonical_patient(target_key)
@@ -87,6 +113,11 @@ def export_bundle(store: "RecordStore") -> dict[str, Any]:
                 key=lambda item: (item.source_entity, item.field_name),
             )
         ],
+        "withdrawal_notices": [_withdrawal_notice(item) for item in store.withdrawal_notices],
+        "version_status_events": [_version_status_event(item) for item in store.version_status_events],
+        "research_exports": [_research_export(item) for item in store.research_exports],
+        "withdrawal_decisions": [_withdrawal_decision(item) for item in store.withdrawal_decisions],
+        "withdrawal_impacts": store.withdrawal_impacts(include_resolved=True),
     }
 
 
@@ -132,3 +163,60 @@ def _identity_operation(operation: Any) -> dict[str, Any]:
     if operation.reverts:
         data["reverts"] = operation.reverts
     return data
+
+
+def _withdrawal_notice(notice: Any) -> dict[str, Any]:
+    data = {
+        "id": notice.id,
+        "source_id": notice.source_id,
+        "target_entity": notice.target_entity,
+        "type": notice.entity_type,
+        "record_id": notice.source_record_id,
+        "version": notice.version,
+        "received_at": notice.received_at,
+        "status": notice.status,
+        "reason": notice.reason,
+        "operator": notice.operator,
+    }
+    if notice.verified_at:
+        data["verified_at"] = notice.verified_at
+    return data
+
+
+def _version_status_event(event: Any) -> dict[str, Any]:
+    return {
+        "id": event.id,
+        "notice_id": event.notice_id,
+        "source_id": event.source_id,
+        "target_entity": event.key.canonical_id(),
+        "type": event.entity_type,
+        "record_id": event.source_record_id,
+        "version": event.version,
+        "event": event.event,
+        "timestamp": event.timestamp,
+        "reason": event.reason,
+        "operator": event.operator,
+    }
+
+
+def _research_export(item: Any) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "timestamp": item.timestamp,
+        "selected_versions": dict(item.selected_versions),
+        "description": item.description,
+        "operator": item.operator,
+        "restrictions": list(item.restrictions),
+    }
+
+
+def _withdrawal_decision(item: Any) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "notice_id": item.notice_id,
+        "affected_context": item.affected_context,
+        "action": item.action,
+        "timestamp": item.timestamp,
+        "reason": item.reason,
+        "operator": item.operator,
+    }

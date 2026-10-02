@@ -27,6 +27,152 @@ def bundle(source_id="hospital-a", records=(), name="Hospital A"):
 
 
 class ExchangeTests(unittest.TestCase):
+    def test_withdrawal_notification_marks_exact_version_without_hiding_history(self):
+        store = RecordStore()
+        store.import_bundle(bundle(records=[
+            record("p-1", "patient", 1, name="Withdrawn"),
+            record("p-1", "patient", 2, name="Current"),
+        ]))
+        outcome, notice = store.receive_withdrawal_notice(
+            source_id="hospital-a",
+            record_type="patient",
+            record_id="p-1",
+            version=1,
+            notice_id="notice-1",
+            reason="source correction",
+            timestamp="2026-10-01T10:00:00Z",
+        )
+
+        self.assertEqual((outcome, notice.status), ("accepted", "verified"))
+        exported = export_bundle(store)
+        patient = exported["entities"][0]
+        self.assertEqual(patient["current_version"], 2)
+        self.assertEqual(patient["effective_current_version"], 2)
+        self.assertEqual(patient["withdrawn_versions"], [1])
+        self.assertEqual(patient["versions"][0]["status"], "withdrawn")
+        self.assertEqual(patient["versions"][0]["data"]["name"], "Withdrawn")
+        self.assertEqual(exported["withdrawal_notices"][0]["target_entity"], "hospital-a/patient/p-1")
+        self.assertEqual(exported["version_status_events"][0]["event"], "withdrawn")
+        self.assertEqual(store.entity_history("hospital-a/patient/p-1")["versions"][0]["status"], "withdrawn")
+
+    def test_withdrawn_current_falls_back_to_older_effective_version(self):
+        store = RecordStore()
+        store.import_bundle(bundle(records=[
+            record("p-1", "patient", 1, name="Valid old"),
+            record("p-1", "patient", 2, name="Invalid latest"),
+        ]))
+        store.receive_withdrawal_notice(
+            source_id="hospital-a",
+            record_type="patient",
+            record_id="p-1",
+            version=2,
+            notice_id="notice-latest",
+        )
+
+        current = store.current_valid_records("hospital-a/patient/p-1")
+        self.assertEqual(current["patient"][0].current_version, 1)
+        self.assertEqual(current["patient"][0].current.data["name"], "Valid old")
+        exported_patient = export_bundle(store)["entities"][0]
+        self.assertEqual(exported_patient["current_version"], 2)
+        self.assertEqual(exported_patient["effective_current_version"], 1)
+        self.assertEqual(exported_patient["data"]["name"], "Valid old")
+        self.assertIn("withdrawn", exported_patient["status"])
+
+    def test_early_duplicate_and_other_source_notice_remain_explicit(self):
+        store = RecordStore()
+        early, notice = store.receive_withdrawal_notice(
+            source_id="hospital-a",
+            record_type="patient",
+            record_id="p-1",
+            version=1,
+            notice_id="notice-early",
+        )
+        self.assertEqual((early, notice.status), ("pending", "pending"))
+
+        result = store.import_bundle(bundle(records=[record("p-1", "patient", 1, name="Arrives later")]))
+        self.assertEqual(result.withdrawal_notices_verified, 1)
+        self.assertEqual(store.withdrawal_notices[0].status, "verified")
+
+        duplicate, _ = store.receive_withdrawal_notice(
+            source_id="hospital-a",
+            record_type="patient",
+            record_id="p-1",
+            version=1,
+            notice_id="notice-early",
+        )
+        self.assertEqual(duplicate, "duplicate")
+        self.assertEqual(len(store.version_status_events), 1)
+
+        store.import_bundle(bundle(source_id="hospital-b", records=[record("p-1", "patient", 1, name="Same local id")]))
+        other, other_notice = store.receive_withdrawal_notice(
+            source_id="hospital-b",
+            record_type="patient",
+            record_id="p-1",
+            version=1,
+            notice_id="notice-other-source",
+        )
+        self.assertEqual((other, other_notice.target_entity), ("accepted", "hospital-b/patient/p-1"))
+        self.assertTrue(store.is_version_withdrawn(EntityKey("hospital-a", "patient", "p-1"), 1))
+        self.assertTrue(store.is_version_withdrawn(EntityKey("hospital-b", "patient", "p-1"), 1))
+
+    def test_withdrawal_impacts_manual_merge_and_research_export_decisions_migrate(self):
+        store = RecordStore()
+        store.import_bundle(bundle(records=[record("p-1", "patient", 1, name="A")]))
+        store.import_bundle(bundle(source_id="hospital-b", records=[record("p-1", "patient", 1, name="A")]))
+        store.merge_patients(
+            "hospital-a/patient/p-1",
+            "hospital-b/patient/p-1",
+            operation_id="merge-1",
+            timestamp="2026-10-01T00:00:00Z",
+        )
+        store.create_research_export(
+            {"hospital-a/patient/p-1": 1},
+            export_id="study-1",
+            timestamp="2026-10-01T01:00:00Z",
+        )
+        store.receive_withdrawal_notice(
+            source_id="hospital-a",
+            record_type="patient",
+            record_id="p-1",
+            version=1,
+            notice_id="notice-impact",
+        )
+
+        impacts = {(item["dependency_type"], item["affected_context"]) for item in store.withdrawal_impacts()}
+        self.assertEqual(
+            impacts,
+            {
+                ("manual_merge", "merge/merge-1"),
+                ("research_export", "research_export/study-1"),
+            },
+        )
+        store.resolve_withdrawal_impact(
+            "merge/merge-1",
+            "notice-impact",
+            "retain_limited_history",
+            decision_id="decision-merge",
+            reason="keep provenance for audited review",
+        )
+        store.resolve_withdrawal_impact(
+            "research_export/study-1",
+            "notice-impact",
+            "retain_limited_history",
+            decision_id="decision-study",
+        )
+
+        exported = export_bundle(store)
+        restored = RecordStore()
+        first = restored.import_bundle(exported)
+        second = restored.import_bundle(exported)
+        self.assertEqual(first.withdrawal_notices_verified, 1)
+        self.assertEqual(second.withdrawal_notices_duplicate, 1)
+        self.assertEqual(len(restored.version_status_events), 1)
+        self.assertEqual(len(restored.withdrawal_decisions), 2)
+        self.assertEqual(export_bundle(restored)["withdrawal_decisions"], exported["withdrawal_decisions"])
+        self.assertEqual(
+            {item["status"] for item in export_bundle(restored)["withdrawal_impacts"]},
+            {"resolved"},
+        )
     def test_out_of_order_records_keep_exact_patient_encounter_observation_links(self):
         store = RecordStore()
         result = store.import_bundle(
