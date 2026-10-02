@@ -96,6 +96,36 @@ only genuinely new versions are appended. Historical snapshots may arrive out
 of revision order; migration fills missing old versions without changing the
 highest current version.
 
+## Source Retraction Notices
+
+A source can retract one specific version of one of its records:
+
+```python
+store.retract_version("hospital-a", "observation", "o-1", 1, reason="wrong code")
+```
+
+Retractions may also arrive inside a `medlocal.v1` bundle under a `retractions`
+key. The notice targets exactly `(source.id, record.type, record.id, version)`;
+a same-named version from another source is never affected. The original data
+and the notice itself are both retained; history is never deleted. Current
+queries (`patient_records`) and exports no longer treat a retracted current
+version as valid: queries skip it (pass `include_retracted=True` to see it),
+and exports mark the entity and version with `"retracted": true`.
+
+Notices arriving before the corresponding record, out of order, or duplicated
+are kept as `pending` relationships (`store.pending_retractions()`) and apply
+automatically once the exact version arrives; duplicate notices are idempotent.
+`store.retraction_impact(...)` lists the manual merges, recorded research
+exports, and dependent entities that relied on the retracted version, so users
+can decide whether to re-select data or keep the result as limited history.
+
+Incremental migration carries retraction notices and export records inside
+`unified.records.v1`; resuming an interrupted migration does not duplicate
+them. After a restart, `store.visible_entities()` returns the current valid
+data, `store.visible_entities(at=timestamp)` reconstructs what was visible at
+that time, and `store.entity_timeline(entity_id)` traces every version and
+retraction state change along the source.
+
 Run tests with:
 
 ```bash

@@ -30,6 +30,7 @@ class Version:
     version: int
     data: dict[str, Any]
     content_hash: str
+    recorded_at: str = ""
 
 
 @dataclass
@@ -64,3 +65,26 @@ class IdentityOperation:
     previous_groups: dict[str, str] = field(default_factory=dict)
     reverts: str = ""
     patient_versions: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RetractionNotice:
+    id: str
+    source_id: str
+    entity_type: str
+    record_id: str
+    version: int
+    timestamp: str
+    reason: str = ""
+    operator: str = ""
+
+    def entity_key(self) -> EntityKey:
+        return EntityKey(self.source_id, self.entity_type, self.record_id)
+
+
+@dataclass(frozen=True)
+class ExportRecord:
+    id: str
+    timestamp: str
+    label: str = ""
+    versions: dict[str, int] = field(default_factory=dict)

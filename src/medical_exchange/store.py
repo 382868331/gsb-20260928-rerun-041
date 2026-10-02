@@ -15,7 +15,16 @@ from .local_format import (
     validate_envelope,
     validate_record,
 )
-from .models import Entity, EntityKey, IdentityOperation, PendingReference, Source, Version
+from .models import (
+    Entity,
+    EntityKey,
+    ExportRecord,
+    IdentityOperation,
+    PendingReference,
+    RetractionNotice,
+    Source,
+    Version,
+)
 
 REFERENCE_FIELDS = {
     "encounter": (("patient_ref", "patient"),),
@@ -38,6 +47,9 @@ class ImportResult:
     resolved_references: int = 0
     pending_references: int = 0
     manual_decisions_preserved: int = 0
+    retractions_applied: int = 0
+    retractions_pending: int = 0
+    retractions_duplicate: int = 0
     failures: list[RecordFailure] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -49,6 +61,9 @@ class ImportResult:
             "resolved_references": self.resolved_references,
             "pending_references": self.pending_references,
             "manual_decisions_preserved": self.manual_decisions_preserved,
+            "retractions_applied": self.retractions_applied,
+            "retractions_pending": self.retractions_pending,
+            "retractions_duplicate": self.retractions_duplicate,
             "failures": [
                 {"record_id": item.record_id, "reason": item.reason}
                 for item in self.failures
@@ -63,6 +78,9 @@ class RecordStore:
         self.pending: set[PendingReference] = set()
         self.identity_operations: list[IdentityOperation] = []
         self.patient_groups: dict[EntityKey, str] = {}
+        self.retractions: list[RetractionNotice] = []
+        self.export_records: list[ExportRecord] = []
+        self._retracted_versions: set[tuple[EntityKey, int]] = set()
 
     def import_bundle(self, bundle: dict[str, Any]) -> ImportResult:
         validate_envelope(bundle)
@@ -86,6 +104,21 @@ class RecordStore:
                 result.duplicate += 1
             else:
                 result.accepted += 1
+
+        for raw_notice in bundle.get("retractions", []):
+            try:
+                _, outcome = self._apply_retraction(raw_notice, source.id)
+            except (ValueError, TypeError) as exc:
+                result.rejected += 1
+                notice_id = raw_notice.get("record_id") if isinstance(raw_notice, dict) else None
+                result.failures.append(RecordFailure(notice_id, str(exc)))
+                continue
+            if outcome == "duplicate":
+                result.retractions_duplicate += 1
+            elif outcome == "applied":
+                result.retractions_applied += 1
+            else:
+                result.retractions_pending += 1
 
         resolved, pending = self._rebuild_references(source.id)
         self._replay_identity_groups()
@@ -204,7 +237,9 @@ class RecordStore:
             key=lambda item: item.canonical_id(),
         )
 
-    def patient_records(self, patient: str | EntityKey) -> dict[str, list[Entity]]:
+    def patient_records(
+        self, patient: str | EntityKey, *, include_retracted: bool = False
+    ) -> dict[str, list[Entity]]:
         canonical = self.canonical_patient(patient)
         group = set(self.patient_group(canonical))
         encounters = []
@@ -213,6 +248,8 @@ class RecordStore:
 
         for key, entity in self.entities.items():
             if key.entity_type != "encounter":
+                continue
+            if not include_retracted and self.is_current_retracted(key):
                 continue
             patient_key = EntityKey(
                 key.source_id, "patient", entity.current.data["patient_ref"]
@@ -224,6 +261,8 @@ class RecordStore:
 
         for key, entity in self.entities.items():
             if key.entity_type != "observation":
+                continue
+            if not include_retracted and self.is_current_retracted(key):
                 continue
             patient_key = EntityKey(
                 key.source_id, "patient", entity.current.data["patient_ref"]
@@ -247,17 +286,232 @@ class RecordStore:
     def merge_patient_identities(self, first_patient: str | EntityKey, second_patient: str | EntityKey, **kwargs: Any) -> IdentityOperation:
         return self.merge_patients(first_patient, second_patient, **kwargs)
 
+    def retract_version(
+        self,
+        source_id: str,
+        entity_type: str,
+        record_id: str,
+        version: int,
+        *,
+        reason: str = "",
+        operator: str = "",
+        timestamp: str | None = None,
+        notice_id: str | None = None,
+    ) -> tuple[RetractionNotice, bool]:
+        notice, outcome = self._apply_retraction(
+            {
+                "id": notice_id,
+                "record_id": record_id,
+                "type": entity_type,
+                "version": version,
+                "reason": reason,
+                "operator": operator,
+                "timestamp": timestamp,
+            },
+            source_id,
+        )
+        return notice, outcome != "duplicate"
+
+    def _apply_retraction(
+        self, raw: Any, source_id: str
+    ) -> tuple[RetractionNotice, str]:
+        if not isinstance(raw, dict):
+            raise ValueError("retraction notice must be an object")
+        record_id = raw.get("record_id")
+        entity_type = raw.get("type")
+        version = raw.get("version")
+        if not isinstance(record_id, str) or not record_id.strip():
+            raise ValueError("retraction record_id is required")
+        if entity_type not in ("patient", "encounter", "observation"):
+            raise ValueError("retraction type must be patient, encounter, or observation")
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            raise ValueError("retraction version must be a positive integer")
+        notice_id = raw.get("id")
+        if notice_id is not None and not isinstance(notice_id, str):
+            raise ValueError("retraction id must be a string")
+        timestamp = raw.get("timestamp") or _utc_now()
+        reason = raw.get("reason") or ""
+        operator = raw.get("operator") or ""
+
+        for existing in self.retractions:
+            if notice_id and existing.id == notice_id:
+                return existing, "duplicate"
+            if (
+                existing.source_id == source_id
+                and existing.entity_type == entity_type
+                and existing.record_id == record_id
+                and existing.version == version
+            ):
+                return existing, "duplicate"
+
+        notice = RetractionNotice(
+            id=notice_id or _operation_id("retract", timestamp, len(self.retractions)),
+            source_id=source_id,
+            entity_type=entity_type,
+            record_id=record_id,
+            version=version,
+            timestamp=timestamp,
+            reason=reason,
+            operator=operator,
+        )
+        self.retractions.append(notice)
+        self._replay_retractions()
+        return notice, self.notice_status(notice)
+
+    def _replay_retractions(self) -> None:
+        retracted: set[tuple[EntityKey, int]] = set()
+        for notice in self.retractions:
+            key = notice.entity_key()
+            entity = self.entities.get(key)
+            if entity is not None and notice.version in entity.versions:
+                retracted.add((key, notice.version))
+        self._retracted_versions = retracted
+
+    def notice_status(self, notice: RetractionNotice) -> str:
+        if (notice.entity_key(), notice.version) in self._retracted_versions:
+            return "applied"
+        return "pending"
+
+    def pending_retractions(self) -> list[RetractionNotice]:
+        return [
+            notice for notice in self.retractions if self.notice_status(notice) == "pending"
+        ]
+
+    def is_version_retracted(self, key: EntityKey, version: int) -> bool:
+        return (key, version) in self._retracted_versions
+
+    def is_current_retracted(self, key: EntityKey) -> bool:
+        entity = self.entities.get(key)
+        if entity is None:
+            return False
+        return (key, entity.current_version) in self._retracted_versions
+
+    def retracted_entities(self) -> list[Entity]:
+        return [
+            entity
+            for key, entity in sorted(
+                self.entities.items(), key=lambda item: item[0].canonical_id()
+            )
+            if self.is_current_retracted(key)
+        ]
+
+    def entity_timeline(self, entity_id: str | EntityKey) -> list[dict[str, Any]]:
+        key = (
+            entity_id
+            if isinstance(entity_id, EntityKey)
+            else self._entity_key_from_id(entity_id)
+        )
+        events: list[dict[str, Any]] = []
+        entity = self.entities.get(key)
+        if entity is not None:
+            for version in sorted(entity.versions.values(), key=lambda item: item.version):
+                events.append(
+                    {
+                        "event": "version_recorded",
+                        "version": version.version,
+                        "timestamp": version.recorded_at,
+                        "content_hash": version.content_hash,
+                        "retracted": self.is_version_retracted(key, version.version),
+                    }
+                )
+        for notice in self.retractions:
+            if notice.entity_key() == key:
+                events.append(
+                    {
+                        "event": "retraction_notice",
+                        "version": notice.version,
+                        "timestamp": notice.timestamp,
+                        "notice_id": notice.id,
+                        "status": self.notice_status(notice),
+                        "reason": notice.reason,
+                        "operator": notice.operator,
+                    }
+                )
+        events.sort(key=lambda item: (item["timestamp"] or "", item["event"]))
+        return events
+
+    def visible_entities(self, at: str | None = None) -> dict[EntityKey, Version]:
+        visible: dict[EntityKey, Version] = {}
+        for key, entity in self.entities.items():
+            if at is None:
+                current = entity.current
+                if not self.is_version_retracted(key, current.version):
+                    visible[key] = current
+                continue
+            candidates = [
+                version
+                for version in entity.versions.values()
+                if not version.recorded_at or version.recorded_at <= at
+            ]
+            retracted_at = {
+                notice.version
+                for notice in self.retractions
+                if notice.entity_key() == key and notice.timestamp <= at
+            }
+            valid = [
+                version for version in candidates if version.version not in retracted_at
+            ]
+            if valid:
+                newest = max(valid, key=lambda item: item.version)
+                visible[key] = newest
+        return visible
+
+    def retraction_impact(
+        self, source_id: str, entity_type: str, record_id: str, version: int
+    ) -> dict[str, Any]:
+        key = EntityKey(source_id, entity_type, record_id)
+        canonical_id = key.canonical_id()
+        notices = [
+            notice
+            for notice in self.retractions
+            if notice.entity_key() == key and notice.version == version
+        ]
+        if not notices:
+            raise ValueError(f"no retraction notice for {canonical_id!r} version {version}")
+
+        merges = []
+        if entity_type == "patient":
+            for operation in self.identity_operations:
+                if operation.patient_versions.get(canonical_id) == version:
+                    merges.append(operation)
+
+        exports = [
+            record
+            for record in self.export_records
+            if record.versions.get(canonical_id) == version
+        ]
+
+        dependents = []
+        for entity_key, entity in self.entities.items():
+            for field_name, target_type in REFERENCE_FIELDS.get(
+                entity_key.entity_type, ()
+            ):
+                if entity_key.source_id != source_id or target_type != entity_type:
+                    continue
+                if entity.current.data.get(field_name) == record_id:
+                    dependents.append(entity_key.canonical_id())
+
+        return {
+            "entity": canonical_id,
+            "version": version,
+            "status": self.notice_status(notices[0]),
+            "notices": [notice.id for notice in notices],
+            "identity_operations": [operation.id for operation in merges],
+            "exports": [record.id for record in exports],
+            "dependent_entities": sorted(dependents),
+        }
+
     def undo_merge(self, merge_operation_id: str, **kwargs: Any) -> IdentityOperation:
         return self.revert_merge(merge_operation_id, **kwargs)
 
     def unmerge_patients(self, merge_operation_id: str, **kwargs: Any) -> IdentityOperation:
         return self.revert_merge(merge_operation_id, **kwargs)
 
-    def query_patient_records(self, patient: str | EntityKey) -> dict[str, list[Entity]]:
-        return self.patient_records(patient)
+    def query_patient_records(self, patient: str | EntityKey, **kwargs: Any) -> dict[str, list[Entity]]:
+        return self.patient_records(patient, **kwargs)
 
-    def unified_patient_records(self, patient: str | EntityKey) -> dict[str, list[Entity]]:
-        return self.patient_records(patient)
+    def unified_patient_records(self, patient: str | EntityKey, **kwargs: Any) -> dict[str, list[Entity]]:
+        return self.patient_records(patient, **kwargs)
 
     def _put_version(
         self,
@@ -266,17 +520,20 @@ class RecordStore:
         entity_type: str,
         version: int,
         data: dict[str, Any],
+        recorded_at: str = "",
     ) -> str:
         key = EntityKey(source_id, entity_type, local_id)
         content_hash = _content_hash(data)
+        recorded_at = recorded_at or _utc_now()
         entity = self.entities.get(key)
 
         if entity is None:
             self.entities[key] = Entity(
                 key=key,
                 current_version=version,
-                versions={version: Version(version, data, content_hash)},
+                versions={version: Version(version, data, content_hash, recorded_at)},
             )
+            self._replay_retractions()
             return "accepted"
 
         existing = entity.versions.get(version)
@@ -293,8 +550,9 @@ class RecordStore:
                 f"{entity.current_version}"
             )
 
-        entity.versions[version] = Version(version, data, content_hash)
+        entity.versions[version] = Version(version, data, content_hash, recorded_at)
         entity.current_version = version
+        self._replay_retractions()
         return "accepted"
 
     def _restore_version(
@@ -305,6 +563,7 @@ class RecordStore:
         version: int,
         data: dict[str, Any],
         expected_hash: str | None = None,
+        recorded_at: str = "",
     ) -> str:
         key = EntityKey(source_id, entity_type, local_id)
         content_hash = _content_hash(data)
@@ -318,20 +577,26 @@ class RecordStore:
             self.entities[key] = Entity(
                 key=key,
                 current_version=version,
-                versions={version: Version(version, data, content_hash)},
+                versions={version: Version(version, data, content_hash, recorded_at)},
             )
+            self._replay_retractions()
             return "accepted"
 
         existing = entity.versions.get(version)
         if existing is not None:
             if existing.content_hash == content_hash:
+                if recorded_at and not existing.recorded_at:
+                    entity.versions[version] = Version(
+                        version, data, content_hash, recorded_at
+                    )
                 return "duplicate"
             raise ConflictError(
                 f"{entity_type} {local_id!r} version {version} has conflicting content"
             )
 
-        entity.versions[version] = Version(version, data, content_hash)
+        entity.versions[version] = Version(version, data, content_hash, recorded_at)
         entity.current_version = max(entity.current_version, version)
+        self._replay_retractions()
         return "accepted"
 
     def _rebuild_references(self, source_id: str) -> tuple[int, int]:
@@ -384,16 +649,21 @@ class RecordStore:
                         item.get("source", {}).get("name", "") or "",
                     ),
                 )
-                outcomes = [self._restore_unified_entity_version(key, item)]
                 current_version = int(item.get("current_version", item.get("version")))
+                current_item = item
+                outcomes = []
                 for historical in item.get("versions", []):
                     if not isinstance(historical, dict):
                         raise ValueError("entity version entries must be objects")
                     if "data" not in historical:
                         continue
                     if int(historical["version"]) == current_version:
+                        if historical.get("recorded_at") and not item.get("recorded_at"):
+                            current_item = dict(item)
+                            current_item["recorded_at"] = historical["recorded_at"]
                         continue
                     outcomes.append(self._restore_unified_entity_version(key, historical))
+                outcomes.append(self._restore_unified_entity_version(key, current_item))
             except (KeyError, TypeError, ValueError) as exc:
                 result.rejected += 1
                 result.failures.append(RecordFailure(entity_id, str(exc)))
@@ -404,6 +674,23 @@ class RecordStore:
         for raw_operation in bundle.get("identity_operations", []):
             self._import_identity_operation(raw_operation)
         self._replay_identity_groups()
+
+        for raw_notice in bundle.get("retractions", []):
+            if not isinstance(raw_notice, dict):
+                continue
+            try:
+                _, outcome = self._apply_retraction(raw_notice, raw_notice.get("source_id", ""))
+            except (ValueError, TypeError):
+                continue
+            if outcome == "applied":
+                result.retractions_applied += 1
+            elif outcome == "pending":
+                result.retractions_pending += 1
+            else:
+                result.retractions_duplicate += 1
+
+        for raw_export in bundle.get("export_records", []):
+            self._import_export_record(raw_export)
 
         all_resolved = 0
         all_pending = 0
@@ -463,6 +750,27 @@ class RecordStore:
             version,
             data,
             expected_hash,
+            item.get("recorded_at") or "",
+        )
+
+    def _import_export_record(self, raw: Any) -> None:
+        if not isinstance(raw, dict):
+            return
+        record_id = raw.get("id")
+        if not isinstance(record_id, str) or not record_id:
+            return
+        if any(item.id == record_id for item in self.export_records):
+            return
+        versions = raw.get("versions", {})
+        if not isinstance(versions, dict):
+            versions = {}
+        self.export_records.append(
+            ExportRecord(
+                id=record_id,
+                timestamp=raw.get("timestamp", "") or "",
+                label=raw.get("label", "") or "",
+                versions={str(key): int(value) for key, value in versions.items()},
+            )
         )
 
     def _replay_identity_groups(self) -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from .models import EntityKey
+from .models import EntityKey, ExportRecord
 
 if TYPE_CHECKING:
     from .store import RecordStore
@@ -10,8 +10,10 @@ if TYPE_CHECKING:
 UNIFIED_FORMAT = "unified.records.v1"
 
 
-def export_bundle(store: "RecordStore") -> dict[str, Any]:
+def export_bundle(store: "RecordStore", label: str = "") -> dict[str, Any]:
     """Export current data, retained versions, and explicit relationship state."""
+    from .store import _operation_id, _utc_now
+
     entities = []
     relationships = []
 
@@ -25,11 +27,14 @@ def export_bundle(store: "RecordStore") -> dict[str, Any]:
                 "source": {"id": key.source_id, "name": source.name if source else ""},
                 "source_record_id": key.source_record_id,
                 "current_version": entity.current_version,
+                "retracted": store.is_current_retracted(key),
                 "data": entity.current.data,
                 "versions": [
                     {
                         "version": item.version,
                         "content_hash": item.content_hash,
+                        "recorded_at": item.recorded_at,
+                        "retracted": store.is_version_retracted(key, item.version),
                         "data": item.data,
                     }
                     for _, item in sorted(entity.versions.items())
@@ -47,6 +52,8 @@ def export_bundle(store: "RecordStore") -> dict[str, Any]:
                 key.source_id, target_type, entity.current.data[field_name]
             )
             status = "resolved" if target_key in store.entities else "pending"
+            if target_key in store.entities and store.is_current_retracted(target_key):
+                status = "retracted"
             effective_target = target_key
             if target_type == "patient" and target_key in store.patient_groups:
                 effective_target = store.canonical_patient(target_key)
@@ -65,8 +72,24 @@ def export_bundle(store: "RecordStore") -> dict[str, Any]:
     relationships.sort(
         key=lambda item: (item["source_entity"], item["field"], item["target_entity"])
     )
+    export_time = _utc_now()
+    export_id = _operation_id("export", export_time, len(store.export_records))
+    store.export_records.append(
+        ExportRecord(
+            id=export_id,
+            timestamp=export_time,
+            label=label,
+            versions={
+                key.canonical_id(): entity.current_version
+                for key, entity in store.entities.items()
+            },
+        )
+    )
     return {
         "format": UNIFIED_FORMAT,
+        "export_id": export_id,
+        "exported_at": export_time,
+        "label": label,
         "sources": [
             {"id": source.id, "name": source.name}
             for source in sorted(store.sources.values(), key=lambda item: item.id)
@@ -75,6 +98,29 @@ def export_bundle(store: "RecordStore") -> dict[str, Any]:
         "relationships": relationships,
         "patient_identity_groups": _identity_groups(store),
         "identity_operations": [_identity_operation(item) for item in store.identity_operations],
+        "retractions": [
+            {
+                "id": notice.id,
+                "source_id": notice.source_id,
+                "type": notice.entity_type,
+                "record_id": notice.record_id,
+                "version": notice.version,
+                "timestamp": notice.timestamp,
+                "reason": notice.reason,
+                "operator": notice.operator,
+                "status": store.notice_status(notice),
+            }
+            for notice in store.retractions
+        ],
+        "export_records": [
+            {
+                "id": record.id,
+                "timestamp": record.timestamp,
+                "label": record.label,
+                "versions": dict(record.versions),
+            }
+            for record in store.export_records
+        ],
         "pending_relationships": [
             {
                 "source_entity": ref.source_entity,
