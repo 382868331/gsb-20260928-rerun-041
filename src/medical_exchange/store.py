@@ -4,9 +4,9 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
-from .exceptions import ConflictError, IdentityError
+from .exceptions import ConflictError, DispositionError, IdentityError
 from .local_format import (
     MEDLOCAL_FORMAT,
     UNIFIED_FORMAT,
@@ -16,6 +16,9 @@ from .local_format import (
     validate_record,
 )
 from .models import (
+    Disposition,
+    DispositionReplacement,
+    DispositionRestriction,
     Entity,
     EntityKey,
     ExportRecord,
@@ -50,6 +53,8 @@ class ImportResult:
     retractions_applied: int = 0
     retractions_pending: int = 0
     retractions_duplicate: int = 0
+    dispositions_imported: int = 0
+    dispositions_duplicate: int = 0
     failures: list[RecordFailure] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -64,6 +69,8 @@ class ImportResult:
             "retractions_applied": self.retractions_applied,
             "retractions_pending": self.retractions_pending,
             "retractions_duplicate": self.retractions_duplicate,
+            "dispositions_imported": self.dispositions_imported,
+            "dispositions_duplicate": self.dispositions_duplicate,
             "failures": [
                 {"record_id": item.record_id, "reason": item.reason}
                 for item in self.failures
@@ -80,6 +87,7 @@ class RecordStore:
         self.patient_groups: dict[EntityKey, str] = {}
         self.retractions: list[RetractionNotice] = []
         self.export_records: list[ExportRecord] = []
+        self.dispositions: list[Disposition] = []
         self._retracted_versions: set[tuple[EntityKey, int]] = set()
 
     def import_bundle(self, bundle: dict[str, Any]) -> ImportResult:
@@ -427,6 +435,28 @@ class RecordStore:
                         "operator": notice.operator,
                     }
                 )
+        for disposition in self.dispositions:
+            notice = next(
+                (
+                    item
+                    for item in self.retractions
+                    if item.id == disposition.retraction_id
+                ),
+                None,
+            )
+            if notice is not None and notice.entity_key() == key:
+                events.append(
+                    {
+                        "event": "disposition",
+                        "version": notice.version,
+                        "timestamp": disposition.timestamp,
+                        "disposition_id": disposition.id,
+                        "target_kind": disposition.target_kind,
+                        "target_id": disposition.target_id,
+                        "operator": disposition.operator,
+                        "reason": disposition.reason,
+                    }
+                )
         events.sort(key=lambda item: (item["timestamp"] or "", item["event"]))
         return events
 
@@ -503,6 +533,317 @@ class RecordStore:
 
     def undo_merge(self, merge_operation_id: str, **kwargs: Any) -> IdentityOperation:
         return self.revert_merge(merge_operation_id, **kwargs)
+
+    def propose_disposition(
+        self,
+        target_kind: str,
+        target_id: str,
+        *,
+        retraction_id: str,
+        replacements: Iterable[dict[str, Any]] = (),
+        restrictions: Iterable[dict[str, Any]] = (),
+        reason: str = "",
+        operator: str = "",
+        timestamp: str | None = None,
+        disposition_id: str | None = None,
+    ) -> Disposition:
+        notice = next(
+            (item for item in self.retractions if item.id == retraction_id), None
+        )
+        if notice is None:
+            raise DispositionError(f"retraction notice {retraction_id!r} does not exist")
+        source_versions, original_choices = self._target_evidence(target_kind, target_id)
+
+        parsed_replacements = tuple(
+            self._validate_replacement(item) for item in replacements
+        )
+        parsed_restrictions = tuple(
+            self._validate_restriction(item) for item in restrictions
+        )
+        if not parsed_replacements and not parsed_restrictions:
+            raise DispositionError(
+                "disposition must replace or restrict at least one field"
+            )
+
+        event_time = timestamp or _utc_now()
+        disposition_id = disposition_id or _operation_id(
+            "disposition", event_time, len(self.dispositions)
+        )
+        existing = next(
+            (item for item in self.dispositions if item.id == disposition_id), None
+        )
+        if existing is not None:
+            return existing
+
+        disposition = Disposition(
+            id=disposition_id,
+            target_kind=target_kind,
+            target_id=target_id,
+            retraction_id=retraction_id,
+            operator=operator,
+            timestamp=event_time,
+            reason=reason,
+            source_versions=source_versions,
+            original_choices=original_choices,
+            replacements=parsed_replacements,
+            restrictions=parsed_restrictions,
+        )
+        self.dispositions.append(disposition)
+        return disposition
+
+    def _target_evidence(
+        self, target_kind: str, target_id: str
+    ) -> tuple[dict[str, int], dict[str, Any]]:
+        if target_kind == "identity_operation":
+            operation = next(
+                (item for item in self.identity_operations if item.id == target_id),
+                None,
+            )
+            if operation is None:
+                raise DispositionError(
+                    f"identity operation {target_id!r} does not exist"
+                )
+            choices: dict[str, Any] = {
+                "operation": operation.operation,
+                "group_id": operation.group_id,
+                "patients": [key.canonical_id() for key in operation.patients],
+            }
+            if operation.canonical_patient is not None:
+                choices["canonical_patient"] = operation.canonical_patient.canonical_id()
+            if operation.reverts:
+                choices["reverts"] = operation.reverts
+            return dict(operation.patient_versions), choices
+        if target_kind == "export":
+            record = next(
+                (item for item in self.export_records if item.id == target_id), None
+            )
+            if record is None:
+                raise DispositionError(f"export record {target_id!r} does not exist")
+            return dict(record.versions), {
+                "label": record.label,
+                "versions": dict(record.versions),
+            }
+        raise DispositionError(
+            "disposition target_kind must be 'identity_operation' or 'export'"
+        )
+
+    def _validate_replacement(self, raw: dict[str, Any]) -> DispositionReplacement:
+        if not isinstance(raw, dict):
+            raise DispositionError("replacement must be an object")
+        field_name = raw.get("field")
+        if not isinstance(field_name, str) or not field_name.strip():
+            raise DispositionError("replacement field is required")
+        entity_id = raw.get("replacement_entity")
+        version = raw.get("replacement_version")
+        if not isinstance(entity_id, str) or not entity_id.strip():
+            raise DispositionError("replacement_entity is required")
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            raise DispositionError("replacement_version must be a positive integer")
+        key = self._entity_key_from_id(entity_id)
+        entity = self.entities.get(key)
+        if entity is None or version not in entity.versions:
+            raise DispositionError(
+                f"replacement version {entity_id!r} v{version} does not exist"
+            )
+        if self.is_version_retracted(key, version):
+            raise DispositionError(
+                f"replacement version {entity_id!r} v{version} is retracted"
+            )
+        scope = raw.get("scope") or ""
+        if not isinstance(scope, str):
+            raise DispositionError("replacement scope must be a string")
+        return DispositionReplacement(
+            field=field_name,
+            replacement_entity=key.canonical_id(),
+            replacement_version=version,
+            scope=scope,
+        )
+
+    def _validate_restriction(self, raw: dict[str, Any]) -> DispositionRestriction:
+        if not isinstance(raw, dict):
+            raise DispositionError("restriction must be an object")
+        field_name = raw.get("field")
+        restriction = raw.get("restriction")
+        if not isinstance(field_name, str) or not field_name.strip():
+            raise DispositionError("restriction field is required")
+        if not isinstance(restriction, str) or not restriction.strip():
+            raise DispositionError("restriction must name the usage limit")
+        scope = raw.get("scope") or ""
+        if not isinstance(scope, str):
+            raise DispositionError("restriction scope must be a string")
+        return DispositionRestriction(
+            field=field_name, restriction=restriction, scope=scope
+        )
+
+    def dispositions_for(
+        self, target_kind: str, target_id: str
+    ) -> list[Disposition]:
+        return [
+            item
+            for item in self.dispositions
+            if item.target_kind == target_kind and item.target_id == target_id
+        ]
+
+    def disposition_conflicts(
+        self, target_kind: str, target_id: str
+    ) -> list[dict[str, Any]]:
+        actions: dict[tuple[str, str], list[tuple[Disposition, tuple[Any, ...]]]] = {}
+        for disposition in self.dispositions_for(target_kind, target_id):
+            for replacement in disposition.replacements:
+                key = (replacement.field, replacement.scope)
+                action = (
+                    "replace",
+                    replacement.replacement_entity,
+                    replacement.replacement_version,
+                )
+                actions.setdefault(key, []).append((disposition, action))
+            for restriction in disposition.restrictions:
+                key = (restriction.field, restriction.scope)
+                action = ("restrict", restriction.restriction)
+                actions.setdefault(key, []).append((disposition, action))
+
+        conflicts = []
+        for (field_name, scope), entries in sorted(actions.items()):
+            distinct = {action for _, action in entries}
+            if len(distinct) < 2:
+                continue
+            conflicts.append(
+                {
+                    "field": field_name,
+                    "scope": scope,
+                    "dispositions": [item.id for item, _ in entries],
+                    "operators": [item.operator for item, _ in entries],
+                    "reasons": [item.reason for item, _ in entries],
+                    "actions": [list(action) for _, action in entries],
+                }
+            )
+        return conflicts
+
+    def compare_disposition(self, disposition_id: str) -> dict[str, Any]:
+        disposition = self._require_disposition(disposition_id)
+        notice = next(
+            item for item in self.retractions if item.id == disposition.retraction_id
+        )
+        key = notice.entity_key()
+        entity = self.entities.get(key)
+        old_version = (
+            entity.versions.get(notice.version) if entity is not None else None
+        )
+        items = []
+        for replacement in disposition.replacements:
+            replacement_key = self._entity_key_from_id(replacement.replacement_entity)
+            new_version = self.entities[replacement_key].versions[
+                replacement.replacement_version
+            ]
+            items.append(
+                {
+                    "field": replacement.field,
+                    "scope": replacement.scope,
+                    "before": (
+                        old_version.data.get(replacement.field)
+                        if old_version is not None
+                        else None
+                    ),
+                    "after": new_version.data.get(replacement.field),
+                    "replacement_entity": replacement.replacement_entity,
+                    "replacement_version": replacement.replacement_version,
+                }
+            )
+        return {
+            "disposition": disposition.id,
+            "retraction": notice.id,
+            "entity": key.canonical_id(),
+            "version": notice.version,
+            "replacements": items,
+        }
+
+    def disposition_view(self, target_kind: str, target_id: str) -> dict[str, Any]:
+        dispositions = self.dispositions_for(target_kind, target_id)
+        conflicts = {
+            (item["field"], item["scope"])
+            for item in self.disposition_conflicts(target_kind, target_id)
+        }
+        affected: dict[tuple[str, str], dict[str, Any]] = {}
+        for disposition in dispositions:
+            notice = next(
+                item
+                for item in self.retractions
+                if item.id == disposition.retraction_id
+            )
+            key = notice.entity_key()
+            entity = self.entities.get(key)
+            old_version = (
+                entity.versions.get(notice.version) if entity is not None else None
+            )
+            old_data = old_version.data if old_version is not None else {}
+            for field_name in old_data:
+                entry = affected.setdefault(
+                    (field_name, ""),
+                    {"field": field_name, "scope": "", "status": "pending"},
+                )
+                entry.setdefault("retracted_value", old_data.get(field_name))
+            for replacement in disposition.replacements:
+                replacement_key = self._entity_key_from_id(
+                    replacement.replacement_entity
+                )
+                new_version = self.entities[replacement_key].versions[
+                    replacement.replacement_version
+                ]
+                affected[(replacement.field, replacement.scope)] = {
+                    "field": replacement.field,
+                    "scope": replacement.scope,
+                    "status": "replaced",
+                    "retracted_value": old_data.get(replacement.field),
+                    "value": new_version.data.get(replacement.field),
+                    "replacement_entity": replacement.replacement_entity,
+                    "replacement_version": replacement.replacement_version,
+                    "decided_by": disposition.id,
+                }
+            for restriction in disposition.restrictions:
+                affected[(restriction.field, restriction.scope)] = {
+                    "field": restriction.field,
+                    "scope": restriction.scope,
+                    "status": "restricted",
+                    "retracted_value": old_data.get(restriction.field),
+                    "restriction": restriction.restriction,
+                    "decided_by": disposition.id,
+                }
+        for field_name, scope in conflicts:
+            if (field_name, scope) in affected:
+                affected[(field_name, scope)]["status"] = "conflict"
+                affected[(field_name, scope)]["decided_by"] = [
+                    item.id
+                    for item in dispositions
+                    if any(
+                        action.field == field_name and action.scope == scope
+                        for action in (*item.replacements, *item.restrictions)
+                    )
+                ]
+        return {
+            "target_kind": target_kind,
+            "target_id": target_id,
+            "fields": [
+                affected[key] for key in sorted(affected, key=lambda item: (item[0], item[1]))
+            ],
+            "decisions": [
+                {
+                    "id": item.id,
+                    "operator": item.operator,
+                    "timestamp": item.timestamp,
+                    "reason": item.reason,
+                    "retraction_id": item.retraction_id,
+                }
+                for item in dispositions
+            ],
+        }
+
+    def _require_disposition(self, disposition_id: str) -> Disposition:
+        disposition = next(
+            (item for item in self.dispositions if item.id == disposition_id), None
+        )
+        if disposition is None:
+            raise DispositionError(f"disposition {disposition_id!r} does not exist")
+        return disposition
 
     def unmerge_patients(self, merge_operation_id: str, **kwargs: Any) -> IdentityOperation:
         return self.revert_merge(merge_operation_id, **kwargs)
@@ -692,6 +1033,13 @@ class RecordStore:
         for raw_export in bundle.get("export_records", []):
             self._import_export_record(raw_export)
 
+        for raw_disposition in bundle.get("dispositions", []):
+            outcome = self._import_disposition(raw_disposition)
+            if outcome == "imported":
+                result.dispositions_imported += 1
+            elif outcome == "duplicate":
+                result.dispositions_duplicate += 1
+
         all_resolved = 0
         all_pending = 0
         for source_id in sorted(self.sources):
@@ -772,6 +1120,53 @@ class RecordStore:
                 versions={str(key): int(value) for key, value in versions.items()},
             )
         )
+
+    def _import_disposition(self, raw: Any) -> str:
+        if not isinstance(raw, dict):
+            return "skipped"
+        disposition_id = raw.get("id")
+        if not isinstance(disposition_id, str) or not disposition_id:
+            return "skipped"
+        if any(item.id == disposition_id for item in self.dispositions):
+            return "duplicate"
+        try:
+            disposition = Disposition(
+                id=disposition_id,
+                target_kind=str(raw.get("target_kind", "")),
+                target_id=str(raw.get("target_id", "")),
+                retraction_id=str(raw.get("retraction_id", "")),
+                operator=str(raw.get("operator", "")),
+                timestamp=str(raw.get("timestamp", "")),
+                reason=str(raw.get("reason", "")),
+                source_versions={
+                    str(key): int(value)
+                    for key, value in (raw.get("source_versions") or {}).items()
+                },
+                original_choices=dict(raw.get("original_choices") or {}),
+                replacements=tuple(
+                    DispositionReplacement(
+                        field=str(item.get("field", "")),
+                        replacement_entity=str(item.get("replacement_entity", "")),
+                        replacement_version=int(item.get("replacement_version", 0)),
+                        scope=str(item.get("scope", "") or ""),
+                    )
+                    for item in (raw.get("replacements") or [])
+                    if isinstance(item, dict)
+                ),
+                restrictions=tuple(
+                    DispositionRestriction(
+                        field=str(item.get("field", "")),
+                        restriction=str(item.get("restriction", "")),
+                        scope=str(item.get("scope", "") or ""),
+                    )
+                    for item in (raw.get("restrictions") or [])
+                    if isinstance(item, dict)
+                ),
+            )
+        except (TypeError, ValueError):
+            return "skipped"
+        self.dispositions.append(disposition)
+        return "imported"
 
     def _replay_identity_groups(self) -> None:
         patient_keys = {key for key in self.entities if key.entity_type == "patient"}

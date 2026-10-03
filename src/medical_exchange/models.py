@@ -88,3 +88,33 @@ class ExportRecord:
     timestamp: str
     label: str = ""
     versions: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DispositionReplacement:
+    field: str
+    replacement_entity: str
+    replacement_version: int
+    scope: str = ""
+
+
+@dataclass(frozen=True)
+class DispositionRestriction:
+    field: str
+    restriction: str
+    scope: str = ""
+
+
+@dataclass(frozen=True)
+class Disposition:
+    id: str
+    target_kind: str
+    target_id: str
+    retraction_id: str
+    operator: str
+    timestamp: str
+    reason: str = ""
+    source_versions: dict[str, int] = field(default_factory=dict)
+    original_choices: dict[str, Any] = field(default_factory=dict)
+    replacements: tuple[DispositionReplacement, ...] = ()
+    restrictions: tuple[DispositionRestriction, ...] = ()

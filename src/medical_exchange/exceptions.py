@@ -12,3 +12,7 @@ class ConflictError(ValueError):
 
 class IdentityError(ValueError):
     """Raised when a manual patient identity operation is invalid."""
+
+
+class DispositionError(ValueError):
+    """Raised when a retraction-impact disposition is invalid."""

@@ -119,6 +119,53 @@ automatically once the exact version arrives; duplicate notices are idempotent.
 exports, and dependent entities that relied on the retracted version, so users
 can decide whether to re-select data or keep the result as limited history.
 
+## Retraction Impact Dispositions
+
+Each impacted result (a manual merge or a recorded research export) is handled
+with an explicit disposition, not a blanket status flip:
+
+```python
+disposition = store.propose_disposition(
+    "export",
+    exported["export_id"],
+    retraction_id=notice.id,
+    replacements=[
+        {
+            "field": "code",
+            "replacement_entity": "hospital-a/observation/o-1",
+            "replacement_version": 2,
+        }
+    ],
+    restrictions=[{"field": "encounter_ref", "restriction": "limited-history"}],
+    reason="source reissued corrected code only",
+    operator="reviewer-1",
+)
+```
+
+A disposition records exactly which retraction notice it answers, the source
+versions the target result was built from, and the original choices (merge
+canonical and group, or export label and versions). Replacements substitute
+only the named fields (optionally within a research `scope`) from a chosen
+newer source version; every other affected field keeps an explicit usage
+restriction or stays `pending`. A replacement must point at an existing,
+non-retracted version: a source re-providing similar content as a new version
+does not erase the retraction or silently re-validate old results.
+
+`store.compare_disposition(id)` shows each replaced field's value before and
+after, so reviewers can adopt only selected parts. Several operators may file
+dispositions for the same result; incompatible actions on the same field are
+never overwritten by the later save. `store.disposition_conflicts(...)` lists
+the conflicting field, the competing disposition ids, operators, and reasons,
+and `store.disposition_view(...)` marks the field as `conflict` while keeping
+every proposal.
+
+Dispositions and their restrictions travel inside `unified.records.v1`;
+incremental migration imports them once by id, so resuming an interrupted
+migration never duplicates a decision. `store.entity_timeline(...)` includes
+disposition events, and `visible_entities(at=...)`, the current valid view,
+and `store.disposition_view(...)` each trace back to the disposition ids,
+operators, and retractions behind them.
+
 Incremental migration carries retraction notices and export records inside
 `unified.records.v1`; resuming an interrupted migration does not duplicate
 them. After a restart, `store.visible_entities()` returns the current valid

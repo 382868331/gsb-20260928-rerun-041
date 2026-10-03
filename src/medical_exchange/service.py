@@ -133,6 +133,38 @@ def export_bundle(store: "RecordStore", label: str = "") -> dict[str, Any]:
                 key=lambda item: (item.source_entity, item.field_name),
             )
         ],
+        "dispositions": [_disposition(item) for item in store.dispositions],
+    }
+
+
+def _disposition(disposition: Any) -> dict[str, Any]:
+    return {
+        "id": disposition.id,
+        "target_kind": disposition.target_kind,
+        "target_id": disposition.target_id,
+        "retraction_id": disposition.retraction_id,
+        "operator": disposition.operator,
+        "timestamp": disposition.timestamp,
+        "reason": disposition.reason,
+        "source_versions": dict(disposition.source_versions),
+        "original_choices": dict(disposition.original_choices),
+        "replacements": [
+            {
+                "field": item.field,
+                "replacement_entity": item.replacement_entity,
+                "replacement_version": item.replacement_version,
+                "scope": item.scope,
+            }
+            for item in disposition.replacements
+        ],
+        "restrictions": [
+            {
+                "field": item.field,
+                "restriction": item.restriction,
+                "scope": item.scope,
+            }
+            for item in disposition.restrictions
+        ],
     }
 
 
