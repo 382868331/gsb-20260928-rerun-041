@@ -126,6 +126,62 @@ data, `store.visible_entities(at=timestamp)` reconstructs what was visible at
 that time, and `store.entity_timeline(entity_id)` traces every version and
 retraction state change along the source.
 
+## Retraction Dispositions
+
+A retraction does not force a single new status onto an affected result.
+Instead, each operator proposes a disposition for a specific research export
+or manual merge, scoped to the exact retraction notice:
+
+```python
+store.propose_disposition(
+    "export",
+    export_id,
+    notice_id,
+    replacements=[
+        {
+            "entity": "hospital-a/observation/o-1",
+            "from_version": 1,
+            "to_version": 2,
+            "fields": ["code"],
+        }
+    ],
+    retained=[
+        {
+            "entity": "hospital-a/observation/o-1",
+            "version": 1,
+            "restriction": "unit kept for reference only, not for dosing",
+        }
+    ],
+    operator="curator-1",
+    reason="only the code was corrected by the source",
+)
+```
+
+Each disposition records the retraction notice it answers, the source versions
+the original decision relied on (`source_versions`), and the operator's
+reason. Replacements may cover selected fields only; everything else keeps its
+original value with an explicit usage restriction. A later source version with
+similar content never erases the retraction or re-validates old exports:
+`store.research_result(export_id)` still marks undisposed entities as
+`retracted` (listed under `pending`) until a disposition covers them.
+
+`store.compare_disposition(disposition_id)` shows the affected fields and
+versions before and after replacement, so users can adopt only selected parts
+via `store.research_result(export_id, adopt=[disposition_id, ...])`.
+
+Multiple operators may propose incompatible dispositions for the same result.
+Proposals are never overwritten: reusing a disposition id with different
+content raises `ConflictError`, and `store.disposition_conflicts(...)`
+reports each conflicting entity and field with both sides' operators, choices,
+and reasons.
+
+Dispositions and their restrictions travel inside `unified.records.v1` under
+a `dispositions` key; importing is idempotent by disposition id, so resuming
+an interrupted migration never duplicates a decision. After migration,
+`store.visible_entities(at=...)`, the current valid view, and
+`store.research_result(...)` each trace back to the recorded notice and
+disposition ids.
+
 Run tests with:
 
 ```bash

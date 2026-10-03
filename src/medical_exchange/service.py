@@ -121,6 +121,36 @@ def export_bundle(store: "RecordStore", label: str = "") -> dict[str, Any]:
             }
             for record in store.export_records
         ],
+        "dispositions": [
+            {
+                "id": disposition.id,
+                "target_kind": disposition.target_kind,
+                "target_id": disposition.target_id,
+                "notice_id": disposition.notice_id,
+                "timestamp": disposition.timestamp,
+                "operator": disposition.operator,
+                "reason": disposition.reason,
+                "source_versions": dict(disposition.source_versions),
+                "replacements": [
+                    {
+                        "entity": item.entity,
+                        "from_version": item.from_version,
+                        "to_version": item.to_version,
+                        "fields": list(item.fields),
+                    }
+                    for item in disposition.replacements
+                ],
+                "retained": [
+                    {
+                        "entity": item.entity,
+                        "version": item.version,
+                        "restriction": item.restriction,
+                    }
+                    for item in disposition.retained
+                ],
+            }
+            for disposition in store.dispositions
+        ],
         "pending_relationships": [
             {
                 "source_entity": ref.source_entity,

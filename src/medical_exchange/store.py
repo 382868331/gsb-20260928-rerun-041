@@ -16,6 +16,9 @@ from .local_format import (
     validate_record,
 )
 from .models import (
+    Disposition,
+    DispositionReplacement,
+    DispositionRetention,
     Entity,
     EntityKey,
     ExportRecord,
@@ -50,6 +53,8 @@ class ImportResult:
     retractions_applied: int = 0
     retractions_pending: int = 0
     retractions_duplicate: int = 0
+    dispositions_imported: int = 0
+    dispositions_duplicate: int = 0
     failures: list[RecordFailure] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -64,6 +69,8 @@ class ImportResult:
             "retractions_applied": self.retractions_applied,
             "retractions_pending": self.retractions_pending,
             "retractions_duplicate": self.retractions_duplicate,
+            "dispositions_imported": self.dispositions_imported,
+            "dispositions_duplicate": self.dispositions_duplicate,
             "failures": [
                 {"record_id": item.record_id, "reason": item.reason}
                 for item in self.failures
@@ -80,6 +87,7 @@ class RecordStore:
         self.patient_groups: dict[EntityKey, str] = {}
         self.retractions: list[RetractionNotice] = []
         self.export_records: list[ExportRecord] = []
+        self.dispositions: list[Disposition] = []
         self._retracted_versions: set[tuple[EntityKey, int]] = set()
 
     def import_bundle(self, bundle: dict[str, Any]) -> ImportResult:
@@ -501,6 +509,266 @@ class RecordStore:
             "dependent_entities": sorted(dependents),
         }
 
+    def propose_disposition(
+        self,
+        target_kind: str,
+        target_id: str,
+        notice_id: str,
+        *,
+        replacements: list[dict[str, Any]] | None = None,
+        retained: list[dict[str, Any]] | None = None,
+        operator: str = "",
+        reason: str = "",
+        disposition_id: str | None = None,
+        timestamp: str | None = None,
+    ) -> tuple[Disposition, bool]:
+        if target_kind not in ("export", "identity_operation"):
+            raise ValueError("target_kind must be 'export' or 'identity_operation'")
+        notice = next(
+            (item for item in self.retractions if item.id == notice_id), None
+        )
+        if notice is None:
+            raise ValueError(f"retraction notice {notice_id!r} does not exist")
+        source_versions = self._target_versions(target_kind, target_id)
+
+        parsed_replacements = tuple(
+            self._parse_replacement(item) for item in (replacements or [])
+        )
+        parsed_retained = tuple(
+            self._parse_retention(item) for item in (retained or [])
+        )
+        if not parsed_replacements and not parsed_retained:
+            raise ValueError("a disposition must replace or explicitly retain something")
+
+        event_time = timestamp or _utc_now()
+        disposition_id = disposition_id or _operation_id(
+            "disposition", event_time, len(self.dispositions)
+        )
+        existing = next(
+            (item for item in self.dispositions if item.id == disposition_id), None
+        )
+        if existing is not None:
+            if (
+                existing.target_kind == target_kind
+                and existing.target_id == target_id
+                and existing.notice_id == notice_id
+                and existing.replacements == parsed_replacements
+                and existing.retained == parsed_retained
+            ):
+                return existing, False
+            raise ConflictError(
+                f"disposition {disposition_id!r} already exists with different content"
+            )
+
+        disposition = Disposition(
+            id=disposition_id,
+            target_kind=target_kind,
+            target_id=target_id,
+            notice_id=notice_id,
+            timestamp=event_time,
+            operator=operator,
+            reason=reason,
+            source_versions=source_versions,
+            replacements=parsed_replacements,
+            retained=parsed_retained,
+        )
+        self.dispositions.append(disposition)
+        return disposition, True
+
+    def _target_versions(self, target_kind: str, target_id: str) -> dict[str, int]:
+        if target_kind == "export":
+            record = next(
+                (item for item in self.export_records if item.id == target_id), None
+            )
+            if record is None:
+                raise ValueError(f"export {target_id!r} does not exist")
+            return dict(record.versions)
+        operation = next(
+            (item for item in self.identity_operations if item.id == target_id), None
+        )
+        if operation is None:
+            raise ValueError(f"identity operation {target_id!r} does not exist")
+        return dict(operation.patient_versions)
+
+    def _parse_replacement(self, raw: Any) -> DispositionReplacement:
+        if not isinstance(raw, dict):
+            raise ValueError("replacement entries must be objects")
+        entity_id = raw.get("entity")
+        if not isinstance(entity_id, str) or not entity_id:
+            raise ValueError("replacement entity is required")
+        key = self._entity_key_from_id(entity_id)
+        entity = self.entities.get(key)
+        if entity is None:
+            raise ValueError(f"entity {entity_id!r} does not exist")
+        from_version = int(raw.get("from_version"))
+        to_version = int(raw.get("to_version"))
+        for version in (from_version, to_version):
+            if version not in entity.versions:
+                raise ValueError(
+                    f"entity {entity_id!r} has no version {version}"
+                )
+        fields = raw.get("fields") or ()
+        if isinstance(fields, str):
+            fields = (fields,)
+        return DispositionReplacement(
+            entity=entity_id,
+            from_version=from_version,
+            to_version=to_version,
+            fields=tuple(str(field) for field in fields),
+        )
+
+    def _parse_retention(self, raw: Any) -> DispositionRetention:
+        if not isinstance(raw, dict):
+            raise ValueError("retention entries must be objects")
+        entity_id = raw.get("entity")
+        if not isinstance(entity_id, str) or not entity_id:
+            raise ValueError("retention entity is required")
+        key = self._entity_key_from_id(entity_id)
+        entity = self.entities.get(key)
+        version = int(raw.get("version"))
+        if entity is None or version not in entity.versions:
+            raise ValueError(f"entity {entity_id!r} has no version {version}")
+        restriction = raw.get("restriction") or ""
+        if not restriction:
+            raise ValueError("retained parts must carry an explicit usage restriction")
+        return DispositionRetention(
+            entity=entity_id, version=version, restriction=str(restriction)
+        )
+
+    def dispositions_for(
+        self, target_kind: str | None = None, target_id: str | None = None
+    ) -> list[Disposition]:
+        return [
+            item
+            for item in self.dispositions
+            if (target_kind is None or item.target_kind == target_kind)
+            and (target_id is None or item.target_id == target_id)
+        ]
+
+    def disposition_conflicts(
+        self, target_kind: str, target_id: str
+    ) -> list[dict[str, Any]]:
+        proposals = self.dispositions_for(target_kind, target_id)
+        conflicts: list[dict[str, Any]] = []
+        for index, first in enumerate(proposals):
+            for second in proposals[index + 1 :]:
+                if first.operator == second.operator:
+                    continue
+                conflicts.extend(_disposition_pair_conflicts(first, second))
+        return conflicts
+
+    def compare_disposition(self, disposition_id: str) -> dict[str, Any]:
+        disposition = next(
+            (item for item in self.dispositions if item.id == disposition_id), None
+        )
+        if disposition is None:
+            raise ValueError(f"disposition {disposition_id!r} does not exist")
+        replacements = []
+        for item in disposition.replacements:
+            entity = self.entities[self._entity_key_from_id(item.entity)]
+            before = entity.versions[item.from_version].data
+            after = entity.versions[item.to_version].data
+            fields = item.fields or tuple(sorted(set(before) | set(after)))
+            replacements.append(
+                {
+                    "entity": item.entity,
+                    "from_version": item.from_version,
+                    "to_version": item.to_version,
+                    "fields": list(fields),
+                    "before": {field: before.get(field) for field in fields},
+                    "after": {field: after.get(field) for field in fields},
+                }
+            )
+        return {
+            "id": disposition.id,
+            "target_kind": disposition.target_kind,
+            "target_id": disposition.target_id,
+            "notice_id": disposition.notice_id,
+            "operator": disposition.operator,
+            "reason": disposition.reason,
+            "source_versions": dict(disposition.source_versions),
+            "replacements": replacements,
+            "retained": [
+                {
+                    "entity": item.entity,
+                    "version": item.version,
+                    "restriction": item.restriction,
+                }
+                for item in disposition.retained
+            ],
+        }
+
+    def research_result(
+        self, export_id: str, adopt: list[str] | None = None
+    ) -> dict[str, Any]:
+        record = next(
+            (item for item in self.export_records if item.id == export_id), None
+        )
+        if record is None:
+            raise ValueError(f"export {export_id!r} does not exist")
+        proposals = self.dispositions_for("export", export_id)
+        if adopt is not None:
+            wanted = set(adopt)
+            unknown = wanted - {item.id for item in proposals}
+            if unknown:
+                raise ValueError(
+                    f"unknown dispositions for export {export_id!r}: {sorted(unknown)}"
+                )
+            proposals = [item for item in proposals if item.id in wanted]
+
+        entities: dict[str, Any] = {}
+        for entity_id, version in sorted(record.versions.items()):
+            key = self._entity_key_from_id(entity_id)
+            entity = self.entities.get(key)
+            if entity is None or version not in entity.versions:
+                continue
+            entry: dict[str, Any] = {
+                "version": version,
+                "data": dict(entity.versions[version].data),
+                "status": "valid",
+                "restrictions": [],
+                "dispositions": [],
+            }
+            if self.is_version_retracted(key, version):
+                entry["status"] = "retracted"
+            entities[entity_id] = entry
+
+        for disposition in proposals:
+            for item in disposition.replacements:
+                entry = entities.get(item.entity)
+                if entry is None or entry["version"] != item.from_version:
+                    continue
+                key = self._entity_key_from_id(item.entity)
+                after = self.entities[key].versions[item.to_version].data
+                fields = item.fields or tuple(after)
+                for field in fields:
+                    if field in after:
+                        entry["data"][field] = after[field]
+                entry["status"] = "replaced"
+                if disposition.id not in entry["dispositions"]:
+                    entry["dispositions"].append(disposition.id)
+            for item in disposition.retained:
+                entry = entities.get(item.entity)
+                if entry is None or entry["version"] != item.version:
+                    continue
+                if entry["status"] != "replaced":
+                    entry["status"] = "restricted"
+                entry["restrictions"].append(item.restriction)
+                if disposition.id not in entry["dispositions"]:
+                    entry["dispositions"].append(disposition.id)
+
+        return {
+            "export_id": export_id,
+            "label": record.label,
+            "entities": entities,
+            "applied_dispositions": [item.id for item in proposals],
+            "pending": [
+                entity_id
+                for entity_id, entry in entities.items()
+                if entry["status"] == "retracted"
+            ],
+        }
+
     def undo_merge(self, merge_operation_id: str, **kwargs: Any) -> IdentityOperation:
         return self.revert_merge(merge_operation_id, **kwargs)
 
@@ -692,6 +960,13 @@ class RecordStore:
         for raw_export in bundle.get("export_records", []):
             self._import_export_record(raw_export)
 
+        for raw_disposition in bundle.get("dispositions", []):
+            outcome = self._import_disposition(raw_disposition)
+            if outcome == "imported":
+                result.dispositions_imported += 1
+            elif outcome == "duplicate":
+                result.dispositions_duplicate += 1
+
         all_resolved = 0
         all_pending = 0
         for source_id in sorted(self.sources):
@@ -773,6 +1048,55 @@ class RecordStore:
             )
         )
 
+    def _import_disposition(self, raw: Any) -> str:
+        if not isinstance(raw, dict):
+            return "skipped"
+        disposition_id = raw.get("id")
+        if not isinstance(disposition_id, str) or not disposition_id:
+            return "skipped"
+        if any(item.id == disposition_id for item in self.dispositions):
+            return "duplicate"
+        target_kind = raw.get("target_kind")
+        target_id = raw.get("target_id")
+        notice_id = raw.get("notice_id")
+        if target_kind not in ("export", "identity_operation"):
+            return "skipped"
+        if not isinstance(target_id, str) or not isinstance(notice_id, str):
+            return "skipped"
+        if not any(item.id == notice_id for item in self.retractions):
+            return "skipped"
+        try:
+            self._target_versions(target_kind, target_id)
+            replacements = tuple(
+                self._parse_replacement(item)
+                for item in raw.get("replacements", [])
+            )
+            retained = tuple(
+                self._parse_retention(item) for item in raw.get("retained", [])
+            )
+        except (ValueError, TypeError):
+            return "skipped"
+        source_versions = raw.get("source_versions", {})
+        if not isinstance(source_versions, dict):
+            source_versions = {}
+        self.dispositions.append(
+            Disposition(
+                id=disposition_id,
+                target_kind=target_kind,
+                target_id=target_id,
+                notice_id=notice_id,
+                timestamp=raw.get("timestamp", "") or "",
+                operator=raw.get("operator", "") or "",
+                reason=raw.get("reason", "") or "",
+                source_versions={
+                    str(key): int(value) for key, value in source_versions.items()
+                },
+                replacements=replacements,
+                retained=retained,
+            )
+        )
+        return "imported"
+
     def _replay_identity_groups(self) -> None:
         patient_keys = {key for key in self.entities if key.entity_type == "patient"}
         groups = {key: key.canonical_id() for key in patient_keys}
@@ -828,6 +1152,105 @@ class RecordStore:
 def _content_hash(data: dict[str, Any]) -> str:
     canonical = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _fields_overlap(first: tuple[str, ...], second: tuple[str, ...]) -> bool:
+    if not first or not second:
+        return True
+    return bool(set(first) & set(second))
+
+
+def _disposition_pair_conflicts(
+    first: Disposition, second: Disposition
+) -> list[dict[str, Any]]:
+    conflicts: list[dict[str, Any]] = []
+
+    def side(disposition: Disposition, choice: str, detail: str) -> dict[str, str]:
+        return {
+            "disposition_id": disposition.id,
+            "operator": disposition.operator,
+            "choice": choice,
+            "detail": detail,
+            "reason": disposition.reason,
+        }
+
+    for first_replacement in first.replacements:
+        for second_replacement in second.replacements:
+            if first_replacement.entity != second_replacement.entity:
+                continue
+            if not _fields_overlap(first_replacement.fields, second_replacement.fields):
+                continue
+            if first_replacement.to_version == second_replacement.to_version:
+                continue
+            conflicts.append(
+                {
+                    "entity": first_replacement.entity,
+                    "fields": sorted(
+                        set(first_replacement.fields) & set(second_replacement.fields)
+                    )
+                    or ["*"],
+                    "sides": [
+                        side(
+                            first,
+                            "replace",
+                            f"replace with version {first_replacement.to_version}",
+                        ),
+                        side(
+                            second,
+                            "replace",
+                            f"replace with version {second_replacement.to_version}",
+                        ),
+                    ],
+                }
+            )
+        for retention in second.retained:
+            if first_replacement.entity != retention.entity:
+                continue
+            if first_replacement.to_version == retention.version:
+                continue
+            conflicts.append(
+                {
+                    "entity": first_replacement.entity,
+                    "fields": list(first_replacement.fields) or ["*"],
+                    "sides": [
+                        side(
+                            first,
+                            "replace",
+                            f"replace with version {first_replacement.to_version}",
+                        ),
+                        side(
+                            second,
+                            "retain",
+                            f"retain version {retention.version}: {retention.restriction}",
+                        ),
+                    ],
+                }
+            )
+    for retention in first.retained:
+        for second_replacement in second.replacements:
+            if retention.entity != second_replacement.entity:
+                continue
+            if retention.version == second_replacement.to_version:
+                continue
+            conflicts.append(
+                {
+                    "entity": retention.entity,
+                    "fields": list(second_replacement.fields) or ["*"],
+                    "sides": [
+                        side(
+                            first,
+                            "retain",
+                            f"retain version {retention.version}: {retention.restriction}",
+                        ),
+                        side(
+                            second,
+                            "replace",
+                            f"replace with version {second_replacement.to_version}",
+                        ),
+                    ],
+                }
+            )
+    return conflicts
 
 
 def _utc_now() -> str:
