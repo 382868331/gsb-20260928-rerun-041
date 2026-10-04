@@ -216,6 +216,39 @@ never re-registers a disposition. The basis of any old export stays queryable
 via `store.export_basis(export_id)`, which returns the recorded versions,
 their content hashes, retraction state, and the dispositions that answer them.
 
+## Recorded Field Decisions
+
+A per-field adoption can be saved as an explicit, exchangeable record instead
+of being passed at query time:
+
+```python
+store.adopt_fields(
+    export_id,
+    {"hospital-a/observation/o-1": {"code": "disp-1"}},
+    operator="curator-1",
+    reason="partial adoption of the first correction",
+)
+```
+
+Each decision keeps the exact adopted candidate (disposition id) and its scope
+(entity and field). `store.research_result(export_id)` applies recorded
+decisions automatically; an explicit `field_choices` argument still overrides
+them for one call. A later `adopt_fields` call re-selects a field, and the
+newest decision wins, so a partial adoption of the first disposition can be
+replaced once a second disposition arrives. Decisions travel inside
+`unified.records.v1` under a `field_decisions` key: saving, reopening, or
+moving to another `RecordStore` keeps the same interpretation, and importing
+the same bundle twice never registers a decision twice (reported as
+`field_decisions_duplicate`). Reusing a decision id with different content
+raises `ConflictError`.
+
+If the source later retracts the version a chosen candidate points to, the
+decision can no longer use that retracted source: only the affected fields
+fall back to `pending` (or `conflict` when other candidates remain), every
+other unhandled field stays pending, adopting a retracted-source candidate is
+rejected, and `store.export_basis(export_id)` still returns the old export's
+recorded versions, hashes, and retraction state.
+
 Run tests with:
 
 ```bash

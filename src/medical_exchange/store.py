@@ -22,6 +22,7 @@ from .models import (
     Entity,
     EntityKey,
     ExportRecord,
+    FieldDecision,
     IdentityOperation,
     PendingReference,
     RetractionNotice,
@@ -55,6 +56,8 @@ class ImportResult:
     retractions_duplicate: int = 0
     dispositions_imported: int = 0
     dispositions_duplicate: int = 0
+    field_decisions_imported: int = 0
+    field_decisions_duplicate: int = 0
     failures: list[RecordFailure] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -71,6 +74,8 @@ class ImportResult:
             "retractions_duplicate": self.retractions_duplicate,
             "dispositions_imported": self.dispositions_imported,
             "dispositions_duplicate": self.dispositions_duplicate,
+            "field_decisions_imported": self.field_decisions_imported,
+            "field_decisions_duplicate": self.field_decisions_duplicate,
             "failures": [
                 {"record_id": item.record_id, "reason": item.reason}
                 for item in self.failures
@@ -88,6 +93,7 @@ class RecordStore:
         self.retractions: list[RetractionNotice] = []
         self.export_records: list[ExportRecord] = []
         self.dispositions: list[Disposition] = []
+        self.field_decisions: list[FieldDecision] = []
         self._retracted_versions: set[tuple[EntityKey, int]] = set()
 
     def import_bundle(self, bundle: dict[str, Any]) -> ImportResult:
@@ -698,6 +704,113 @@ class RecordStore:
             ],
         }
 
+    def adopt_fields(
+        self,
+        export_id: str,
+        choices: dict[str, dict[str, str]],
+        *,
+        operator: str = "",
+        reason: str = "",
+        decision_id: str | None = None,
+        timestamp: str | None = None,
+    ) -> tuple[FieldDecision, bool]:
+        record = next(
+            (item for item in self.export_records if item.id == export_id), None
+        )
+        if record is None:
+            raise ValueError(f"export {export_id!r} does not exist")
+        if not choices:
+            raise ValueError("field adoption choices must not be empty")
+        proposals = self.dispositions_for("export", export_id)
+        known_ids = {item.id for item in proposals}
+        normalized: dict[str, dict[str, str]] = {}
+        for entity_id, fields in choices.items():
+            if entity_id not in record.versions:
+                raise ValueError(
+                    f"entity {entity_id!r} is not part of export {export_id!r}"
+                )
+            if not isinstance(fields, dict) or not fields:
+                raise ValueError("field adoption choices must name fields")
+            normalized[entity_id] = {}
+            for field_name, disposition_id in fields.items():
+                if disposition_id not in known_ids:
+                    raise ValueError(
+                        f"unknown dispositions for export {export_id!r}: "
+                        f"{[disposition_id]}"
+                    )
+                disposition = next(
+                    item for item in proposals if item.id == disposition_id
+                )
+                if not self._choice_covers(
+                    disposition, entity_id, record.versions[entity_id], field_name
+                ):
+                    raise ValueError(
+                        f"disposition {disposition_id!r} does not cover "
+                        f"field {field_name!r} of {entity_id!r}"
+                    )
+                normalized[entity_id][str(field_name)] = disposition_id
+
+        event_time = timestamp or _utc_now()
+        decision_id = decision_id or _operation_id(
+            "field-decision", event_time, len(self.field_decisions)
+        )
+        existing = next(
+            (item for item in self.field_decisions if item.id == decision_id), None
+        )
+        if existing is not None:
+            if existing.export_id == export_id and existing.choices == normalized:
+                return existing, False
+            raise ConflictError(
+                f"field decision {decision_id!r} already exists with different content"
+            )
+        decision = FieldDecision(
+            id=decision_id,
+            export_id=export_id,
+            timestamp=event_time,
+            operator=operator,
+            reason=reason,
+            choices=normalized,
+        )
+        self.field_decisions.append(decision)
+        return decision, True
+
+    def field_decisions_for(self, export_id: str) -> list[FieldDecision]:
+        return [item for item in self.field_decisions if item.export_id == export_id]
+
+    def _recorded_field_choices(self, export_id: str) -> dict[str, dict[str, str]]:
+        merged: dict[str, dict[str, str]] = {}
+        for decision in self.field_decisions:
+            if decision.export_id != export_id:
+                continue
+            for entity_id, fields in decision.choices.items():
+                merged.setdefault(entity_id, {}).update(fields)
+        return merged
+
+    def _choice_covers(
+        self,
+        disposition: Disposition,
+        entity_id: str,
+        version: int,
+        field_name: str,
+    ) -> bool:
+        for item in disposition.replacements:
+            if item.entity != entity_id or item.from_version != version:
+                continue
+            key = self._entity_key_from_id(item.entity)
+            if self.is_version_retracted(key, item.to_version):
+                continue
+            entity = self.entities.get(key)
+            if entity is None or item.to_version not in entity.versions:
+                continue
+            after = entity.versions[item.to_version].data
+            names = item.fields or tuple(after)
+            if field_name in names and field_name in after:
+                return True
+        for item in disposition.retained:
+            if item.entity == entity_id and item.version == version:
+                return True
+        return False
+
     def research_result(
         self,
         export_id: str,
@@ -719,9 +832,9 @@ class RecordStore:
                 )
             proposals = [item for item in proposals if item.id in wanted]
 
-        field_choices = field_choices or {}
+        explicit_choices = field_choices or {}
         known_ids = {item.id for item in proposals}
-        for entity_id, choices in field_choices.items():
+        for entity_id, choices in explicit_choices.items():
             if entity_id not in record.versions:
                 raise ValueError(
                     f"entity {entity_id!r} is not part of export {export_id!r}"
@@ -731,6 +844,7 @@ class RecordStore:
                 raise ValueError(
                     f"unknown dispositions for export {export_id!r}: {sorted(unknown)}"
                 )
+        recorded_choices = self._recorded_field_choices(export_id)
 
         entities: dict[str, Any] = {}
         for entity_id, version in sorted(record.versions.items()):
@@ -764,6 +878,8 @@ class RecordStore:
                 if entry is None or entry["version"] != item.from_version:
                     continue
                 key = self._entity_key_from_id(item.entity)
+                if self.is_version_retracted(key, item.to_version):
+                    continue
                 after = self.entities[key].versions[item.to_version].data
                 for name in item.fields or tuple(after):
                     if name not in after:
@@ -791,7 +907,8 @@ class RecordStore:
 
         conflicts: list[dict[str, Any]] = []
         for entity_id, entry in entities.items():
-            choices = field_choices.get(entity_id, {})
+            explicit = explicit_choices.get(entity_id, {})
+            recorded = recorded_choices.get(entity_id, {})
             replaced: set[str] = set()
             retentions = entry.pop("retentions")
             replaced_by = entry.pop("replaced_by")
@@ -804,8 +921,11 @@ class RecordStore:
                 ]
                 chosen_replace = None
                 chosen_retain = None
-                if name in choices:
-                    chosen_id = choices[name]
+                chosen_id = explicit.get(name)
+                strict = chosen_id is not None
+                if chosen_id is None:
+                    chosen_id = recorded.get(name)
+                if chosen_id is not None:
                     chosen_replace = next(
                         (
                             candidate
@@ -822,13 +942,15 @@ class RecordStore:
                                 if disposition.id == chosen_id
                             ),
                             None,
-                        )
+                    )
                     if chosen_replace is None and chosen_retain is None:
-                        raise ValueError(
-                            f"disposition {chosen_id!r} does not cover "
-                            f"field {name!r} of {entity_id!r}"
-                        )
-                elif candidates:
+                        if strict:
+                            raise ValueError(
+                                f"disposition {chosen_id!r} does not cover "
+                                f"field {name!r} of {entity_id!r}"
+                            )
+                        chosen_id = None
+                if chosen_id is None and candidates:
                     by_version = {candidate["to_version"] for candidate in candidates}
                     operators = {candidate["operator"] for candidate in candidates}
                     opposing = [
@@ -854,7 +976,7 @@ class RecordStore:
                             {"entity": entity_id, "field": name, "candidates": sides}
                         )
                         continue
-                elif own_retentions:
+                elif chosen_id is None and own_retentions:
                     chosen_retain = own_retentions[0]
                 if chosen_replace is not None:
                     entry["data"][name] = chosen_replace["value"]
@@ -894,6 +1016,9 @@ class RecordStore:
             "label": record.label,
             "entities": entities,
             "applied_dispositions": [item.id for item in proposals],
+            "field_decisions": [
+                item.id for item in self.field_decisions if item.export_id == export_id
+            ],
             "pending": [
                 entity_id
                 for entity_id, entry in entities.items()
@@ -1200,6 +1325,13 @@ class RecordStore:
             elif outcome == "duplicate":
                 result.dispositions_duplicate += 1
 
+        for raw_decision in bundle.get("field_decisions", []):
+            outcome = self._import_field_decision(raw_decision)
+            if outcome == "imported":
+                result.field_decisions_imported += 1
+            elif outcome == "duplicate":
+                result.field_decisions_duplicate += 1
+
         all_resolved = 0
         all_pending = 0
         for source_id in sorted(self.sources):
@@ -1326,6 +1458,42 @@ class RecordStore:
                 },
                 replacements=replacements,
                 retained=retained,
+            )
+        )
+        return "imported"
+
+    def _import_field_decision(self, raw: Any) -> str:
+        if not isinstance(raw, dict):
+            return "skipped"
+        decision_id = raw.get("id")
+        export_id = raw.get("export_id")
+        if not isinstance(decision_id, str) or not decision_id:
+            return "skipped"
+        if not isinstance(export_id, str) or not export_id:
+            return "skipped"
+        if any(item.id == decision_id for item in self.field_decisions):
+            return "duplicate"
+        if not any(item.id == export_id for item in self.export_records):
+            return "skipped"
+        raw_choices = raw.get("choices", {})
+        if not isinstance(raw_choices, dict) or not raw_choices:
+            return "skipped"
+        choices: dict[str, dict[str, str]] = {}
+        for entity_id, fields in raw_choices.items():
+            if not isinstance(fields, dict):
+                return "skipped"
+            choices[str(entity_id)] = {
+                str(field): str(disposition_id)
+                for field, disposition_id in fields.items()
+            }
+        self.field_decisions.append(
+            FieldDecision(
+                id=decision_id,
+                export_id=export_id,
+                timestamp=raw.get("timestamp", "") or "",
+                operator=raw.get("operator", "") or "",
+                reason=raw.get("reason", "") or "",
+                choices=choices,
             )
         )
         return "imported"
