@@ -182,6 +182,38 @@ an interrupted migration never duplicates a decision. After migration,
 `store.research_result(...)` each trace back to the recorded notice and
 disposition ids.
 
+## Field-Level Adoption
+
+When two dispositions propose different new versions for the same research
+field, `store.compare_field(export_id, entity_id, field)` shows the original
+value and version side by side with every candidate: its source disposition,
+operator, reason, target version, value, and any usage restrictions. Nothing
+is resolved by proposal or import order.
+
+The user then chooses an adoption scope explicitly:
+
+```python
+store.adopt_fields(export_id, disposition_id, fields=["code"], operator="lead-1")
+```
+
+Adoptions are recorded decisions. `store.research_result(export_id)` reports a
+per-field status — `replaced`, `restricted`, `pending`, or `conflict` — next
+to the entity-level status. A partial adoption validates only the adopted
+fields; every other field of a retracted version stays `pending`. If two
+adopted dispositions disagree on a field, the field becomes `conflict`, keeps
+its original value, and lists both disposition ids under `conflicts`; it is
+never silently settled by whichever decision arrived first or last. Retracting
+a source version later only sends the fields that depended on that version
+back to `pending`; fields sourced from other versions stay valid.
+
+Adoptions travel inside `unified.records.v1` under an `adoptions` key, so a
+partially decided workspace can be exported and resumed on another store with
+its pending state intact. Importing is idempotent by adoption id: re-importing
+the same bundle is reported as `adoptions_duplicate` and never registers a
+decision twice. `store.export_basis(export_id)` keeps the exact versions,
+content hashes, retraction notices, and dispositions an old export relied on
+queryable even after newer source versions arrive.
+
 Run tests with:
 
 ```bash

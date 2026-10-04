@@ -117,3 +117,13 @@ class Disposition:
     source_versions: dict[str, int] = field(default_factory=dict)
     replacements: tuple[DispositionReplacement, ...] = ()
     retained: tuple[DispositionRetention, ...] = ()
+
+
+@dataclass(frozen=True)
+class Adoption:
+    id: str
+    export_id: str
+    disposition_id: str
+    timestamp: str
+    operator: str = ""
+    fields: tuple[str, ...] = ()

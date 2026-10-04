@@ -163,6 +163,17 @@ def export_bundle(store: "RecordStore", label: str = "") -> dict[str, Any]:
                 key=lambda item: (item.source_entity, item.field_name),
             )
         ],
+        "adoptions": [
+            {
+                "id": adoption.id,
+                "export_id": adoption.export_id,
+                "disposition_id": adoption.disposition_id,
+                "timestamp": adoption.timestamp,
+                "operator": adoption.operator,
+                "fields": list(adoption.fields),
+            }
+            for adoption in store.adoptions
+        ],
     }
 
 
