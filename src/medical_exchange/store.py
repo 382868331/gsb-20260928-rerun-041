@@ -699,7 +699,10 @@ class RecordStore:
         }
 
     def research_result(
-        self, export_id: str, adopt: list[str] | None = None
+        self,
+        export_id: str,
+        adopt: list[str] | None = None,
+        field_choices: dict[str, dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         record = next(
             (item for item in self.export_records if item.id == export_id), None
@@ -716,22 +719,44 @@ class RecordStore:
                 )
             proposals = [item for item in proposals if item.id in wanted]
 
+        field_choices = field_choices or {}
+        known_ids = {item.id for item in proposals}
+        for entity_id, choices in field_choices.items():
+            if entity_id not in record.versions:
+                raise ValueError(
+                    f"entity {entity_id!r} is not part of export {export_id!r}"
+                )
+            unknown = set(choices.values()) - known_ids
+            if unknown:
+                raise ValueError(
+                    f"unknown dispositions for export {export_id!r}: {sorted(unknown)}"
+                )
+
         entities: dict[str, Any] = {}
         for entity_id, version in sorted(record.versions.items()):
             key = self._entity_key_from_id(entity_id)
             entity = self.entities.get(key)
             if entity is None or version not in entity.versions:
                 continue
-            entry: dict[str, Any] = {
+            data = dict(entity.versions[version].data)
+            retracted = self.is_version_retracted(key, version)
+            entities[entity_id] = {
                 "version": version,
-                "data": dict(entity.versions[version].data),
-                "status": "valid",
+                "data": data,
+                "status": "retracted" if retracted else "valid",
                 "restrictions": [],
                 "dispositions": [],
+                "replaced_by": {},
+                "retentions": [],
+                "fields": {
+                    name: {
+                        "value": value,
+                        "status": "pending" if retracted else "valid",
+                        "dispositions": [],
+                    }
+                    for name, value in data.items()
+                },
             }
-            if self.is_version_retracted(key, version):
-                entry["status"] = "retracted"
-            entities[entity_id] = entry
 
         for disposition in proposals:
             for item in disposition.replacements:
@@ -740,22 +765,129 @@ class RecordStore:
                     continue
                 key = self._entity_key_from_id(item.entity)
                 after = self.entities[key].versions[item.to_version].data
-                fields = item.fields or tuple(after)
-                for field in fields:
-                    if field in after:
-                        entry["data"][field] = after[field]
-                entry["status"] = "replaced"
-                if disposition.id not in entry["dispositions"]:
-                    entry["dispositions"].append(disposition.id)
+                for name in item.fields or tuple(after):
+                    if name not in after:
+                        continue
+                    entry["replaced_by"].setdefault(name, set()).add(disposition.id)
+                    entry["fields"].setdefault(
+                        name, {"value": None, "status": "pending", "dispositions": []}
+                    ).setdefault("candidates", []).append(
+                        {
+                            "disposition_id": disposition.id,
+                            "operator": disposition.operator,
+                            "choice": "replace",
+                            "to_version": item.to_version,
+                            "value": after[name],
+                        }
+                    )
             for item in disposition.retained:
                 entry = entities.get(item.entity)
                 if entry is None or entry["version"] != item.version:
                     continue
-                if entry["status"] != "replaced":
-                    entry["status"] = "restricted"
                 entry["restrictions"].append(item.restriction)
+                entry["retentions"].append((disposition, item.restriction))
                 if disposition.id not in entry["dispositions"]:
                     entry["dispositions"].append(disposition.id)
+
+        conflicts: list[dict[str, Any]] = []
+        for entity_id, entry in entities.items():
+            choices = field_choices.get(entity_id, {})
+            replaced: set[str] = set()
+            retentions = entry.pop("retentions")
+            replaced_by = entry.pop("replaced_by")
+            for name, field_entry in entry["fields"].items():
+                candidates = field_entry.pop("candidates", [])
+                own_retentions = [
+                    (disposition, restriction)
+                    for disposition, restriction in retentions
+                    if disposition.id not in replaced_by.get(name, set())
+                ]
+                chosen_replace = None
+                chosen_retain = None
+                if name in choices:
+                    chosen_id = choices[name]
+                    chosen_replace = next(
+                        (
+                            candidate
+                            for candidate in candidates
+                            if candidate["disposition_id"] == chosen_id
+                        ),
+                        None,
+                    )
+                    if chosen_replace is None:
+                        chosen_retain = next(
+                            (
+                                (disposition, restriction)
+                                for disposition, restriction in own_retentions
+                                if disposition.id == chosen_id
+                            ),
+                            None,
+                        )
+                    if chosen_replace is None and chosen_retain is None:
+                        raise ValueError(
+                            f"disposition {chosen_id!r} does not cover "
+                            f"field {name!r} of {entity_id!r}"
+                        )
+                elif candidates:
+                    by_version = {candidate["to_version"] for candidate in candidates}
+                    operators = {candidate["operator"] for candidate in candidates}
+                    opposing = [
+                        (disposition, restriction)
+                        for disposition, restriction in own_retentions
+                        if disposition.operator not in operators
+                    ]
+                    if len(by_version) == 1 and not opposing:
+                        chosen_replace = candidates[0]
+                    else:
+                        sides = list(candidates) + [
+                            {
+                                "disposition_id": disposition.id,
+                                "operator": disposition.operator,
+                                "choice": "retain",
+                                "restriction": restriction,
+                            }
+                            for disposition, restriction in opposing
+                        ]
+                        field_entry["status"] = "conflict"
+                        field_entry["candidates"] = sides
+                        conflicts.append(
+                            {"entity": entity_id, "field": name, "candidates": sides}
+                        )
+                        continue
+                elif own_retentions:
+                    chosen_retain = own_retentions[0]
+                if chosen_replace is not None:
+                    entry["data"][name] = chosen_replace["value"]
+                    field_entry["value"] = chosen_replace["value"]
+                    field_entry["status"] = "replaced"
+                    field_entry["from_version"] = entry["version"]
+                    field_entry["to_version"] = chosen_replace["to_version"]
+                    replaced.add(name)
+                    for candidate in candidates:
+                        for target in (field_entry["dispositions"], entry["dispositions"]):
+                            if candidate["disposition_id"] not in target:
+                                target.append(candidate["disposition_id"])
+                elif chosen_retain is not None:
+                    disposition, restriction = chosen_retain
+                    field_entry["status"] = "restricted"
+                    field_entry["restriction"] = restriction
+                    for retained_disposition, retained_restriction in own_retentions:
+                        if retained_restriction not in field_entry.setdefault(
+                            "restrictions", []
+                        ):
+                            field_entry["restrictions"].append(retained_restriction)
+                        if (
+                            retained_disposition.id
+                            not in field_entry["dispositions"]
+                        ):
+                            field_entry["dispositions"].append(retained_disposition.id)
+            statuses = {item["status"] for item in entry["fields"].values()}
+            if "conflict" in statuses:
+                entry["status"] = "conflict"
+            elif replaced:
+                entry["status"] = "replaced"
+            elif entry["restrictions"]:
+                entry["status"] = "restricted"
 
         return {
             "export_id": export_id,
@@ -766,6 +898,107 @@ class RecordStore:
                 entity_id
                 for entity_id, entry in entities.items()
                 if entry["status"] == "retracted"
+            ],
+            "pending_fields": {
+                entity_id: sorted(
+                    name
+                    for name, item in entry["fields"].items()
+                    if item["status"] == "pending"
+                )
+                for entity_id, entry in entities.items()
+                if any(
+                    item["status"] == "pending" for item in entry["fields"].values()
+                )
+            },
+            "conflicts": conflicts,
+        }
+
+    def field_candidates(self, export_id: str) -> dict[str, Any]:
+        record = next(
+            (item for item in self.export_records if item.id == export_id), None
+        )
+        if record is None:
+            raise ValueError(f"export {export_id!r} does not exist")
+        proposals = self.dispositions_for("export", export_id)
+        entities: dict[str, Any] = {}
+        for disposition in proposals:
+            for item in disposition.replacements:
+                key = self._entity_key_from_id(item.entity)
+                entity = self.entities.get(key)
+                if entity is None or item.from_version not in entity.versions:
+                    continue
+                before = entity.versions[item.from_version].data
+                after = entity.versions[item.to_version].data
+                entry = entities.setdefault(
+                    item.entity,
+                    {
+                        "version": item.from_version,
+                        "retracted": self.is_version_retracted(key, item.from_version),
+                        "original": dict(before),
+                        "candidates": {},
+                        "restrictions": [],
+                    },
+                )
+                for name in item.fields or tuple(after):
+                    if name not in after:
+                        continue
+                    entry["candidates"].setdefault(name, []).append(
+                        {
+                            "disposition_id": disposition.id,
+                            "operator": disposition.operator,
+                            "reason": disposition.reason,
+                            "to_version": item.to_version,
+                            "value": after[name],
+                        }
+                    )
+            for item in disposition.retained:
+                key = self._entity_key_from_id(item.entity)
+                entity = self.entities.get(key)
+                if entity is None or item.version not in entity.versions:
+                    continue
+                entry = entities.setdefault(
+                    item.entity,
+                    {
+                        "version": item.version,
+                        "retracted": self.is_version_retracted(key, item.version),
+                        "original": dict(entity.versions[item.version].data),
+                        "candidates": {},
+                        "restrictions": [],
+                    },
+                )
+                entry["restrictions"].append(
+                    {
+                        "disposition_id": disposition.id,
+                        "operator": disposition.operator,
+                        "reason": disposition.reason,
+                        "restriction": item.restriction,
+                    }
+                )
+        return {"export_id": export_id, "label": record.label, "entities": entities}
+
+    def export_basis(self, export_id: str) -> dict[str, Any]:
+        record = next(
+            (item for item in self.export_records if item.id == export_id), None
+        )
+        if record is None:
+            raise ValueError(f"export {export_id!r} does not exist")
+        versions: dict[str, Any] = {}
+        for entity_id, version in sorted(record.versions.items()):
+            key = self._entity_key_from_id(entity_id)
+            entity = self.entities.get(key)
+            item = entity.versions.get(version) if entity else None
+            versions[entity_id] = {
+                "version": version,
+                "content_hash": item.content_hash if item else None,
+                "retracted": self.is_version_retracted(key, version),
+            }
+        return {
+            "export_id": export_id,
+            "label": record.label,
+            "timestamp": record.timestamp,
+            "versions": versions,
+            "dispositions": [
+                item.id for item in self.dispositions_for("export", export_id)
             ],
         }
 

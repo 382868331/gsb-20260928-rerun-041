@@ -182,6 +182,40 @@ an interrupted migration never duplicates a decision. After migration,
 `store.research_result(...)` each trace back to the recorded notice and
 disposition ids.
 
+## Field-Level Disposition Resolution
+
+When two dispositions propose different new versions for the same research
+field, `store.field_candidates(export_id)` shows the original value, every
+candidate (disposition id, operator, reason, target version, value), and the
+recorded restrictions side by side, so a user can choose the adoption scope
+field by field:
+
+```python
+result = store.research_result(
+    export_id,
+    field_choices={"hospital-a/observation/o-1": {"code": "disp-1"}},
+)
+```
+
+Conflicts are never resolved by import or proposal order. Adopting two
+incompatible dispositions marks the contested field (and its entity) as
+`conflict` and keeps the original value until an explicit `field_choices`
+entry picks a side; a choice may also name a retention-only disposition to
+keep the old value under its restriction. Every field in
+`research_result(...)` carries its own status - `valid`, `replaced`,
+`restricted`, `pending`, or `conflict` - so a partial correction never makes
+the other fields of a retracted version silently valid: uncovered fields stay
+`pending` (also listed under `pending_fields`), and a retraction only affects
+the fields that actually depend on the retracted version.
+
+Partial adoption is safe to move: after adopting only some fields, exporting
+and importing into another `RecordStore` preserves the pending state, and a
+second decision arriving later (proposed locally or carried in a unified
+bundle) still conflicts instead of overwriting. Re-importing the same bundle
+never re-registers a disposition. The basis of any old export stays queryable
+via `store.export_basis(export_id)`, which returns the recorded versions,
+their content hashes, retraction state, and the dispositions that answer them.
+
 Run tests with:
 
 ```bash
