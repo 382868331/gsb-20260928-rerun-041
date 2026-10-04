@@ -301,6 +301,85 @@ class PendingStateMigrationTests(unittest.TestCase):
         self.assertEqual(entry["fields"]["code"]["status"], "replaced")
         self.assertEqual(entry["fields"]["unit"]["status"], "replaced")
 
+    def test_field_decisions_survive_reopen_exchange_and_later_switch(self):
+        store, exported, notice, first, _ = store_with_conflict()
+        export_id = exported["export_id"]
+        entity_id = "hospital-a/observation/o-1"
+
+        initial = store.research_result(
+            export_id,
+            field_choices={entity_id: {"code": first.id}},
+        )
+        self.assertEqual(initial["entities"][entity_id]["data"]["code"], "CBC-NEW")
+        self.assertEqual(initial["entities"][entity_id]["fields"]["unit"]["status"], "conflict")
+
+        reopened = store.research_result(export_id)
+        self.assertEqual(reopened["entities"][entity_id]["data"]["code"], "CBC-NEW")
+        self.assertEqual(reopened["entities"][entity_id]["fields"]["code"]["status"], "replaced")
+        self.assertEqual(reopened["entities"][entity_id]["fields"]["unit"]["status"], "conflict")
+
+        migrated = export_bundle(store)
+        restored = RecordStore()
+        first_import = restored.import_bundle(migrated)
+        self.assertEqual(first_import.field_decisions_imported, 1)
+        second_import = restored.import_bundle(migrated)
+        self.assertEqual(second_import.field_decisions_duplicate, 1)
+        self.assertEqual(second_import.field_decisions_imported, 0)
+
+        after_move = restored.research_result(export_id)
+        self.assertEqual(after_move["entities"][entity_id]["data"]["code"], "CBC-NEW")
+        self.assertEqual(after_move["entities"][entity_id]["fields"]["unit"]["status"], "conflict")
+
+        second = next(item for item in restored.dispositions if item.id == "disp-2")
+        switched = restored.research_result(
+            export_id,
+            field_choices={
+                entity_id: {"code": second.id, "unit": second.id}
+            },
+        )
+        self.assertEqual(switched["entities"][entity_id]["data"]["code"], "CBC-ALT")
+        self.assertEqual(switched["entities"][entity_id]["data"]["unit"], "g/dL")
+
+        exchanged_again = export_bundle(restored)
+        reopened_store = RecordStore()
+        reopened_import = reopened_store.import_bundle(exchanged_again)
+        self.assertEqual(reopened_import.field_decisions_imported, 2)
+        final = reopened_store.research_result(export_id)
+        self.assertEqual(final["entities"][entity_id]["data"]["code"], "CBC-ALT")
+        self.assertEqual(final["entities"][entity_id]["data"]["unit"], "g/dL")
+        self.assertEqual(final["conflicts"], [])
+
+    def test_retracting_chosen_candidate_only_reopens_related_field(self):
+        store, exported, notice, first, second = store_with_conflict()
+        export_id = exported["export_id"]
+        entity_id = "hospital-a/observation/o-1"
+
+        store.research_result(
+            export_id,
+            field_choices={entity_id: {"code": first.id, "unit": second.id}},
+        )
+        store.retract_version(
+            "hospital-a", "observation", "o-1", 2, reason="correction withdrawn"
+        )
+
+        result = store.research_result(export_id)
+        entry = result["entities"][entity_id]
+        self.assertEqual(entry["data"]["code"], "CBC")
+        self.assertEqual(entry["data"]["unit"], "g/dL")
+        self.assertEqual(entry["fields"]["code"]["status"], "conflict")
+        self.assertEqual(entry["fields"]["unit"]["status"], "replaced")
+        self.assertEqual(
+            [item["field"] for item in result["conflicts"]], ["code"]
+        )
+
+        migrated = export_bundle(store)
+        restored = RecordStore()
+        restored.import_bundle(migrated)
+        moved = restored.research_result(export_id)
+        self.assertEqual(moved["entities"][entity_id]["fields"]["code"]["status"], "conflict")
+        self.assertEqual(moved["entities"][entity_id]["fields"]["unit"]["status"], "replaced")
+        self.assertEqual(moved["entities"][entity_id]["data"]["code"], "CBC")
+
 
 if __name__ == "__main__":
     unittest.main()

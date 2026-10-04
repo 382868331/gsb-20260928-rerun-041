@@ -117,3 +117,15 @@ class Disposition:
     source_versions: dict[str, int] = field(default_factory=dict)
     replacements: tuple[DispositionReplacement, ...] = ()
     retained: tuple[DispositionRetention, ...] = ()
+
+
+@dataclass(frozen=True)
+class FieldDecision:
+    id: str
+    export_id: str
+    entity: str
+    field: str
+    disposition_id: str
+    choice: str = ""
+    from_version: int = 0
+    to_version: int = 0

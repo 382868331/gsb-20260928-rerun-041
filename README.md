@@ -177,7 +177,11 @@ and reasons.
 
 Dispositions and their restrictions travel inside `unified.records.v1` under
 a `dispositions` key; importing is idempotent by disposition id, so resuming
-an interrupted migration never duplicates a decision. After migration,
+an interrupted migration never duplicates a decision. Explicit per-field choices
+travel under `field_decisions` and retain the chosen disposition, replacement
+or retain choice, original version, and replacement target version. Re-importing
+the same record is a duplicate; choosing another candidate updates that one
+field-scoped record. After migration,
 `store.visible_entities(at=...)`, the current valid view, and
 `store.research_result(...)` each trace back to the recorded notice and
 disposition ids.
@@ -209,12 +213,15 @@ the other fields of a retracted version silently valid: uncovered fields stay
 the fields that actually depend on the retracted version.
 
 Partial adoption is safe to move: after adopting only some fields, exporting
-and importing into another `RecordStore` preserves the pending state, and a
-second decision arriving later (proposed locally or carried in a unified
-bundle) still conflicts instead of overwriting. Re-importing the same bundle
-never re-registers a disposition. The basis of any old export stays queryable
-via `store.export_basis(export_id)`, which returns the recorded versions,
-their content hashes, retraction state, and the dispositions that answer them.
+and importing into another `RecordStore` preserves the adopted values and the
+pending or conflict state of the other fields. A later `field_choices` entry
+can switch one field to a newly arrived candidate without changing the rest.
+If the replacement version behind a saved choice is later retracted, that
+choice is not applied; the affected field returns to `conflict` when another
+candidate exists or `pending` otherwise, while unaffected fields keep their
+state. The basis of any old export stays queryable via
+`store.export_basis(export_id)`, which returns the recorded versions, their
+content hashes, retraction state, and the dispositions that answer them.
 
 Run tests with:
 

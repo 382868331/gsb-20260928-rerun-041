@@ -151,6 +151,22 @@ def export_bundle(store: "RecordStore", label: str = "") -> dict[str, Any]:
             }
             for disposition in store.dispositions
         ],
+        "field_decisions": [
+            {
+                "id": decision.id,
+                "export_id": decision.export_id,
+                "entity": decision.entity,
+                "field": decision.field,
+                "disposition_id": decision.disposition_id,
+                "choice": decision.choice,
+                "from_version": decision.from_version,
+                "to_version": decision.to_version,
+            }
+            for decision in sorted(
+                store.field_decisions.values(),
+                key=lambda item: (item.export_id, item.entity, item.field),
+            )
+        ],
         "pending_relationships": [
             {
                 "source_entity": ref.source_entity,
