@@ -923,6 +923,7 @@ class RecordStore:
                 chosen_retain = None
                 chosen_id = explicit.get(name)
                 strict = chosen_id is not None
+                recorded_choice_invalid = False
                 if chosen_id is None:
                     chosen_id = recorded.get(name)
                 if chosen_id is not None:
@@ -950,6 +951,25 @@ class RecordStore:
                                 f"field {name!r} of {entity_id!r}"
                             )
                         chosen_id = None
+                        recorded_choice_invalid = True
+                        field_entry["invalid_disposition_id"] = recorded[name]
+                if chosen_id is None and recorded_choice_invalid:
+                    sides = list(candidates) + [
+                        {
+                            "disposition_id": disposition.id,
+                            "operator": disposition.operator,
+                            "choice": "retain",
+                            "restriction": restriction,
+                        }
+                        for disposition, restriction in own_retentions
+                    ]
+                    if sides:
+                        field_entry["status"] = "conflict"
+                        field_entry["candidates"] = sides
+                        conflicts.append(
+                            {"entity": entity_id, "field": name, "candidates": sides}
+                        )
+                    continue
                 if chosen_id is None and candidates:
                     by_version = {candidate["to_version"] for candidate in candidates}
                     operators = {candidate["operator"] for candidate in candidates}
@@ -982,6 +1002,7 @@ class RecordStore:
                     entry["data"][name] = chosen_replace["value"]
                     field_entry["value"] = chosen_replace["value"]
                     field_entry["status"] = "replaced"
+                    field_entry["disposition_id"] = chosen_id
                     field_entry["from_version"] = entry["version"]
                     field_entry["to_version"] = chosen_replace["to_version"]
                     replaced.add(name)
@@ -992,6 +1013,7 @@ class RecordStore:
                 elif chosen_retain is not None:
                     disposition, restriction = chosen_retain
                     field_entry["status"] = "restricted"
+                    field_entry["disposition_id"] = chosen_id
                     field_entry["restriction"] = restriction
                     for retained_disposition, retained_restriction in own_retentions:
                         if retained_restriction not in field_entry.setdefault(
@@ -1051,6 +1073,10 @@ class RecordStore:
                 key = self._entity_key_from_id(item.entity)
                 entity = self.entities.get(key)
                 if entity is None or item.from_version not in entity.versions:
+                    continue
+                if item.to_version not in entity.versions or self.is_version_retracted(
+                    key, item.to_version
+                ):
                     continue
                 before = entity.versions[item.from_version].data
                 after = entity.versions[item.to_version].data
