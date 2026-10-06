@@ -249,6 +249,15 @@ other unhandled field stays pending, adopting a retracted-source candidate is
 rejected, and `store.export_basis(export_id)` still returns the old export's
 recorded versions, hashes, and retraction state.
 
+An invalidated decision is never silently re-resolved onto an earlier choice:
+the field keeps the export's original value and waits for review, while every
+past decision stays on record as history (visible via
+`store.field_decisions_for(export_id)` and in the exported `field_decisions`
+key). Only an explicit new `adopt_fields` call (or a one-off `field_choices`
+argument) forms a new valid decision. Retracting an intermediate candidate
+does not disturb a later valid choice, and re-importing the same bundle
+neither re-registers decisions nor changes the current interpretation.
+
 Run tests with:
 
 ```bash

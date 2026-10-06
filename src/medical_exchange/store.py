@@ -949,7 +949,32 @@ class RecordStore:
                                 f"disposition {chosen_id!r} does not cover "
                                 f"field {name!r} of {entity_id!r}"
                             )
-                        chosen_id = None
+                        # A recorded decision whose basis is gone (for example
+                        # its target version was retracted) stays on record as
+                        # history but is never silently re-resolved onto an
+                        # earlier choice. The field falls back to pending, or
+                        # to conflict while other candidates remain, until the
+                        # user explicitly re-selects.
+                        if candidates:
+                            operators = {
+                                candidate["operator"] for candidate in candidates
+                            }
+                            sides = list(candidates) + [
+                                {
+                                    "disposition_id": disposition.id,
+                                    "operator": disposition.operator,
+                                    "choice": "retain",
+                                    "restriction": restriction,
+                                }
+                                for disposition, restriction in own_retentions
+                                if disposition.operator not in operators
+                            ]
+                            field_entry["status"] = "conflict"
+                            field_entry["candidates"] = sides
+                            conflicts.append(
+                                {"entity": entity_id, "field": name, "candidates": sides}
+                            )
+                        continue
                 if chosen_id is None and candidates:
                     by_version = {candidate["to_version"] for candidate in candidates}
                     operators = {candidate["operator"] for candidate in candidates}

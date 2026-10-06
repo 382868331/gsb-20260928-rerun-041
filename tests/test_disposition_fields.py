@@ -513,5 +513,160 @@ class RecordedFieldDecisionTests(unittest.TestCase):
         self.assertEqual(entry["fields"]["code"]["value"], "CBC")
 
 
+def patient_store_with_name_candidates():
+    store = RecordStore()
+    store.import_bundle(
+        bundle(
+            records=[
+                record(
+                    "p-1",
+                    "patient",
+                    1,
+                    name="Zhang San",
+                    birth_date="1980-01-01",
+                ),
+                record("e-1", "encounter", 1, patient_ref="p-1"),
+            ]
+        )
+    )
+    exported = export_bundle(store, label="research-name")
+    export_id = exported["export_id"]
+    notice, _ = store.retract_version(
+        "hospital-a", "patient", "p-1", 1, reason="name recorded incorrectly"
+    )
+    store.import_bundle(
+        bundle(records=[record("p-1", "patient", 2, name="Zhang San A", birth_date="1980-01-01")])
+    )
+    store.import_bundle(
+        bundle(records=[record("p-1", "patient", 3, name="Zhang San B", birth_date="1980-01-01")])
+    )
+    store.import_bundle(
+        bundle(records=[record("p-1", "patient", 4, name="Zhang San C", birth_date="1980-01-01")])
+    )
+    for disposition_id, to_version in (("disp-a", 2), ("disp-b", 3), ("disp-c", 4)):
+        store.propose_disposition(
+            "export",
+            export_id,
+            notice.id,
+            replacements=[
+                {
+                    "entity": "hospital-a/patient/p-1",
+                    "from_version": 1,
+                    "to_version": to_version,
+                    "fields": ["name"],
+                }
+            ],
+            operator=f"curator-{to_version}",
+            disposition_id=disposition_id,
+        )
+    return store, export_id
+
+
+class InvalidatedFieldDecisionTests(unittest.TestCase):
+    def test_retracted_current_choice_does_not_readopt_earlier_choice(self):
+        store, export_id = patient_store_with_name_candidates()
+        entity_id = "hospital-a/patient/p-1"
+
+        store.adopt_fields(export_id, {entity_id: {"name": "disp-a"}}, decision_id="fd-1")
+        store.adopt_fields(export_id, {entity_id: {"name": "disp-b"}}, decision_id="fd-2")
+        result = store.research_result(export_id)
+        entry = result["entities"][entity_id]
+        self.assertEqual(entry["data"]["name"], "Zhang San B")
+        self.assertEqual(entry["fields"]["name"]["status"], "replaced")
+
+        store.retract_version(
+            "hospital-a", "patient", "p-1", 3, reason="correction withdrawn"
+        )
+        result = store.research_result(export_id)
+        entry = result["entities"][entity_id]
+        self.assertEqual(entry["data"]["name"], "Zhang San")
+        self.assertEqual(entry["fields"]["name"]["value"], "Zhang San")
+        self.assertIn(entry["fields"]["name"]["status"], ("pending", "conflict"))
+        self.assertNotEqual(entry["fields"]["name"]["status"], "replaced")
+        self.assertEqual(result["field_decisions"], ["fd-1", "fd-2"])
+        self.assertEqual(
+            [item.id for item in store.field_decisions_for(export_id)],
+            ["fd-1", "fd-2"],
+        )
+
+        with self.assertRaises(ValueError):
+            store.adopt_fields(
+                export_id, {entity_id: {"name": "disp-b"}}, decision_id="fd-3"
+            )
+
+        store.adopt_fields(export_id, {entity_id: {"name": "disp-a"}}, decision_id="fd-4")
+        result = store.research_result(export_id)
+        entry = result["entities"][entity_id]
+        self.assertEqual(entry["data"]["name"], "Zhang San A")
+        self.assertEqual(entry["fields"]["name"]["status"], "replaced")
+        self.assertEqual(entry["fields"]["name"]["to_version"], 2)
+
+    def test_intermediate_retraction_keeps_current_choice(self):
+        store, export_id = patient_store_with_name_candidates()
+        entity_id = "hospital-a/patient/p-1"
+        store.adopt_fields(export_id, {entity_id: {"name": "disp-a"}}, decision_id="fd-1")
+        store.adopt_fields(export_id, {entity_id: {"name": "disp-b"}}, decision_id="fd-2")
+        store.adopt_fields(export_id, {entity_id: {"name": "disp-c"}}, decision_id="fd-3")
+
+        store.retract_version(
+            "hospital-a", "patient", "p-1", 3, reason="intermediate withdrawn"
+        )
+        result = store.research_result(export_id)
+        entry = result["entities"][entity_id]
+        self.assertEqual(entry["data"]["name"], "Zhang San C")
+        self.assertEqual(entry["fields"]["name"]["status"], "replaced")
+        self.assertEqual(entry["fields"]["name"]["to_version"], 4)
+        self.assertEqual(result["field_decisions"], ["fd-1", "fd-2", "fd-3"])
+
+    def test_invalidation_survives_save_reopen_and_duplicate_import(self):
+        store, export_id = patient_store_with_name_candidates()
+        entity_id = "hospital-a/patient/p-1"
+        store.adopt_fields(export_id, {entity_id: {"name": "disp-a"}}, decision_id="fd-1")
+        store.adopt_fields(export_id, {entity_id: {"name": "disp-b"}}, decision_id="fd-2")
+        store.adopt_fields(export_id, {entity_id: {"name": "disp-c"}}, decision_id="fd-3")
+        store.retract_version("hospital-a", "patient", "p-1", 3, reason="withdrawn")
+        store.retract_version("hospital-a", "patient", "p-1", 4, reason="withdrawn")
+
+        result = store.research_result(export_id)
+        entry = result["entities"][entity_id]
+        self.assertEqual(entry["data"]["name"], "Zhang San")
+        self.assertIn(entry["fields"]["name"]["status"], ("pending", "conflict"))
+        self.assertEqual(entry["fields"]["birth_date"]["status"], "pending")
+        self.assertEqual(entry["fields"]["birth_date"]["value"], "1980-01-01")
+        encounter = result["entities"]["hospital-a/encounter/e-1"]
+        self.assertEqual(encounter["status"], "valid")
+
+        basis = store.export_basis(export_id)
+        self.assertEqual(basis["versions"][entity_id]["version"], 1)
+        self.assertTrue(basis["versions"][entity_id]["retracted"])
+
+        migrated = export_bundle(store)
+        restored = RecordStore()
+        first_import = restored.import_bundle(migrated)
+        self.assertEqual(first_import.field_decisions_imported, 3)
+        second_import = restored.import_bundle(migrated)
+        self.assertEqual(second_import.field_decisions_imported, 0)
+        self.assertEqual(second_import.field_decisions_duplicate, 3)
+
+        result = restored.research_result(export_id)
+        entry = result["entities"][entity_id]
+        self.assertEqual(entry["data"]["name"], "Zhang San")
+        self.assertIn(entry["fields"]["name"]["status"], ("pending", "conflict"))
+        self.assertEqual(entry["fields"]["birth_date"]["status"], "pending")
+        self.assertEqual(result["field_decisions"], ["fd-1", "fd-2", "fd-3"])
+        basis = restored.export_basis(export_id)
+        self.assertEqual(basis["versions"][entity_id]["version"], 1)
+        self.assertTrue(basis["versions"][entity_id]["retracted"])
+
+        restored.adopt_fields(
+            export_id, {entity_id: {"name": "disp-a"}}, decision_id="fd-4"
+        )
+        result = restored.research_result(export_id)
+        entry = result["entities"][entity_id]
+        self.assertEqual(entry["data"]["name"], "Zhang San A")
+        self.assertEqual(entry["fields"]["name"]["status"], "replaced")
+        self.assertEqual(entry["fields"]["birth_date"]["status"], "pending")
+
+
 if __name__ == "__main__":
     unittest.main()
